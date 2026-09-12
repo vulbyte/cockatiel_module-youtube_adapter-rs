@@ -1,0 +1,3 @@
+[submodule "cockatiel_lib"]
+	path = cockatiel_lib
+	url = https://github.com/vulbyte/cockatiel_lib

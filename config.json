@@ -1,0 +1,10 @@
+{
+  "engine_port": ,
+  "module_specific": {
+    "api_key": "",
+    "channel_id": ""
+  },
+  "pairing_pin": ,
+  "priority": 100,
+  "process_position": "input"
+}
