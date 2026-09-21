@@ -319,7 +319,20 @@ fn save_oauth_refresh_token(refresh_token: &str) {
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const YT_FORCE_SSL: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
-const OAUTH_REDIRECT: &str = "http://localhost:3000";
+
+/// Loopback port for the OAuth redirect listener. Read from the top-level
+/// `oauth_redirect_port` key in config.json (default 3000, so existing
+/// platform-console registrations keep working).
+fn load_oauth_redirect_port() -> u16 {
+    std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|v| v.get("oauth_redirect_port").cloned())
+        .and_then(|p| p.as_u64())
+        .filter(|p| (1..=u16::MAX as u64).contains(p))
+        .map(|p| p as u16)
+        .unwrap_or(3000)
+}
 
 /// Manages a Google OAuth2 token for `youtube.force-ssl`: acquires a refresh
 /// token via the browser flow (or accepts one pasted into the config), then
@@ -328,18 +341,29 @@ const OAUTH_REDIRECT: &str = "http://localhost:3000";
 struct OAuthManager {
     client_id: String,
     client_secret: String,
+    oauth_redirect_port: u16,
     refresh_token: Arc<Mutex<Option<String>>>,
     access_token: Arc<Mutex<Option<(String, Instant)>>>,
 }
 
 impl OAuthManager {
-    fn new(client_id: &str, client_secret: &str, refresh_token: Option<String>) -> Self {
+    fn new(
+        client_id: &str,
+        client_secret: &str,
+        refresh_token: Option<String>,
+        oauth_redirect_port: u16,
+    ) -> Self {
         Self {
             client_id: client_id.to_string(),
             client_secret: client_secret.to_string(),
+            oauth_redirect_port,
             refresh_token: Arc::new(Mutex::new(refresh_token)),
             access_token: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn redirect_uri(&self) -> String {
+        format!("http://localhost:{}", self.oauth_redirect_port)
     }
 
     fn has_creds(&self) -> bool {
@@ -350,12 +374,12 @@ impl OAuthManager {
         *self.refresh_token.lock().unwrap() = Some(token.to_string());
     }
 
-    /// Open the browser and capture the OAuth authorization code back on
-    /// localhost:3000 (Google uses a code, not a fragment).
+    /// Open the browser and capture the OAuth authorization code back on the
+    /// configured loopback redirect port (Google uses a code, not a fragment).
     async fn capture_code(&self, auth_url: &str) -> Result<String, String> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", self.oauth_redirect_port))
             .await
-            .map_err(|e| format!("could not bind localhost:3000: {}", e))?;
+            .map_err(|e| format!("could not bind localhost:{}: {}", self.oauth_redirect_port, e))?;
         let _ = open::that(auth_url);
 
         let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
@@ -394,7 +418,7 @@ impl OAuthManager {
         let auth_url = format!(
             "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
             self.client_id,
-            OAUTH_REDIRECT,
+            self.redirect_uri(),
             urlencode(YT_FORCE_SSL)
         );
         let code = self.capture_code(&auth_url).await?;
@@ -405,7 +429,7 @@ impl OAuthManager {
                 ("code", code.as_str()),
                 ("client_id", self.client_id.as_str()),
                 ("client_secret", self.client_secret.as_str()),
-                ("redirect_uri", OAUTH_REDIRECT),
+                ("redirect_uri", self.redirect_uri().as_str()),
                 ("grant_type", "authorization_code"),
             ])
             .send()
@@ -1801,6 +1825,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let oauth_client_id = saved_cfg.as_ref().and_then(|c| c.google_oauth_client_id.clone()).unwrap_or_default();
     let oauth_client_secret = saved_cfg.as_ref().and_then(|c| c.google_oauth_client_secret.clone()).unwrap_or_default();
     let oauth_refresh = saved_cfg.as_ref().and_then(|c| c.refresh_token.clone()).unwrap_or_default();
+    let oauth_redirect_port = load_oauth_redirect_port();
     let oauth = OAuthManager::new(
         &oauth_client_id,
         &oauth_client_secret,
@@ -1809,6 +1834,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Some(oauth_refresh.clone())
         },
+        oauth_redirect_port,
     );
 
     // The live chat id currently being monitored (shared with the send task).
