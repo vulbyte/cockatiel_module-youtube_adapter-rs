@@ -1,5 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = "../../cockatiel_engine-rs/cockatiel_lib/cockatiel_proto";
+    // Vendored copy of the YouTube gRPC live-chat API proto — this module is
+    // self-contained and does not reach into the engine's repo.
+    let proto_dir = ".";
     println!("cargo:rerun-if-changed={}/youtube_stream_list.proto", proto_dir);
 
     tonic_build::configure()
