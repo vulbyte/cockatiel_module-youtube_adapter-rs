@@ -1,15 +1,29 @@
-use lib_cockatiel::{container::Payload, CockatielClient, MessagePreProcess};
+use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, PromptKind};
+use futures_util::{SinkExt, StreamExt as _};
+use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{self, Write};
+
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tonic::transport::ClientTlsConfig;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+type WsWriteHalf = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    WsMessage,
+>;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct YoutubeAdapterConfig {
     channel_id: Option<String>,
     api_key: Option<String>,
@@ -17,6 +31,12 @@ struct YoutubeAdapterConfig {
     api_keys: Option<Vec<String>>,
     #[serde(default)]
     unlisted_video_ids: Option<Vec<String>>,
+    #[serde(default)]
+    google_oauth_client_id: Option<String>,
+    #[serde(default)]
+    google_oauth_client_secret: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,28 +121,179 @@ impl ApiKeyManager {
     }
 }
 
-fn load_adapter_config() -> Option<YoutubeAdapterConfig> {
-    let path = PathBuf::from("config.json");
-    if !path.exists() {
-        return None;
+/// Tests whether the current YouTube API key is valid by making a lightweight Search API request.
+async fn is_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> bool {
+    let api_key = keys.current_key();
+    if api_key.is_empty() {
+        return false;
     }
-    let data = std::fs::read_to_string(path).ok()?;
-    let json_val: serde_json::Value = serde_json::from_str(&data).ok()?;
-    if let Some(mod_spec) = json_val.get("module_specific") {
-        serde_json::from_value(mod_spec.clone()).ok()
-    } else {
-        None
+    let url = format!(
+        "https://www.googleapis.com/youtube/v3/search?part=snippet&q=cockatiel&type=video&maxResults=1&key={}",
+        api_key
+    );
+    match client.get(&url).send().await {
+        Ok(res) => match res.json::<serde_json::Value>().await {
+            Ok(json) => !json.get("error").is_some(),
+            Err(_) => false,
+        },
+        Err(_) => false,
     }
 }
 
-fn save_adapter_config(channel_id: &str, api_keys: &[String], unlisted_ids: &[String]) {
+/// Parse a moderator command (!ban / !timeout) from a chat message.
+fn parse_mod_command(message: &str, author: &str) -> Option<(String, serde_json::Value)> {
+    let trimmed = message.trim();
+    let lower = trimmed.to_lowercase();
+
+    if lower.starts_with("!ban") {
+        let args = trimmed[5..].trim();
+        let (target, rest) = match args.split_once(char::is_whitespace) {
+            Some((t, r)) => (t, r),
+            None => (args, ""),
+        };
+        let target = target.trim_start_matches('@').to_string();
+        if target.is_empty() {
+            return None;
+        }
+        return Some((
+            "mod_ban".to_string(),
+            serde_json::json!({
+                "platform": "youtube",
+                "handle": target,
+                "reason": rest.trim().to_string(),
+                "actor": { "platform": "youtube", "handle": author },
+            }),
+        ));
+    }
+
+    if lower.starts_with("!timeout") {
+        let args = trimmed[9..].trim();
+        let mut parts = args.split_whitespace();
+        let target = parts.next().unwrap_or("").trim_start_matches('@').to_string();
+        if target.is_empty() {
+            return None;
+        }
+        let mut duration_secs = 300i64;
+        let mut reason = String::new();
+        if let Some(d) = parts.next() {
+            if let Ok(secs) = d.parse::<i64>() {
+                duration_secs = secs;
+            } else {
+                reason = d.to_string();
+            }
+        }
+        let rest: Vec<&str> = parts.collect();
+        if !rest.is_empty() {
+            if !reason.is_empty() {
+                reason = format!("{} {}", reason, rest.join(" "));
+            } else {
+                reason = rest.join(" ");
+            }
+        }
+        return Some((
+            "mod_timeout".to_string(),
+            serde_json::json!({
+                "platform": "youtube",
+                "handle": target,
+                "duration_secs": duration_secs,
+                "reason": reason,
+                "actor": { "platform": "youtube", "handle": author },
+            }),
+        ));
+    }
+
+    None
+}
+
+fn load_adapter_config() -> Option<YoutubeAdapterConfig> {
+    // Secrets live in `.env` (loaded into env at startup); channel/settings
+    // come from config.json.
+    let settings: YoutubeAdapterConfig = std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|v| v.get("module_specific").cloned())
+        .and_then(|s| serde_json::from_value(s).ok())
+        .unwrap_or_default();
+
+    let mut cfg = YoutubeAdapterConfig {
+        channel_id: settings.channel_id.clone().filter(|s| !s.is_empty()),
+        api_keys: settings.api_keys.clone().filter(|k| !k.is_empty()),
+        unlisted_video_ids: settings.unlisted_video_ids.clone(),
+        ..Default::default()
+    };
+    if cfg.channel_id.is_none() {
+        cfg.channel_id = Some(std::env::var("YOUTUBE_CHANNEL_ID").unwrap_or_default()).filter(|s| !s.is_empty());
+    }
+    if cfg.api_keys.is_none() {
+        if let Ok(keys) = std::env::var("YOUTUBE_API_KEY") {
+            let parts: Vec<String> = keys
+                .split('\n')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() {
+                cfg.api_keys = Some(parts);
+            }
+        }
+    }
+    // OAuth secrets from `.env` (key-named env vars, no adapter prefix).
+    for (field, env) in [
+        (&mut cfg.google_oauth_client_id, "google_oauth_client_id"),
+        (&mut cfg.google_oauth_client_secret, "google_oauth_client_secret"),
+        (&mut cfg.refresh_token, "refresh_token"),
+    ] {
+        let v = std::env::var(env).unwrap_or_default();
+        if !v.is_empty() {
+            *field = Some(v);
+        }
+    }
+    Some(cfg)
+}
+
+fn save_adapter_config(
+    channel_id: &str,
+    api_keys: &[String],
+    unlisted_ids: &[String],
+    oauth_client_id: &str,
+    oauth_client_secret: &str,
+    refresh_token: &str,
+) {
+    // Preserve existing OAuth values unless a new one is supplied.
+    let existing = load_adapter_config();
+    let oauth_client_id = if oauth_client_id.is_empty() {
+        existing.as_ref().and_then(|c| c.google_oauth_client_id.clone()).unwrap_or_default()
+    } else {
+        oauth_client_id.to_string()
+    };
+    let oauth_client_secret = if oauth_client_secret.is_empty() {
+        existing.as_ref().and_then(|c| c.google_oauth_client_secret.clone()).unwrap_or_default()
+    } else {
+        oauth_client_secret.to_string()
+    };
+    let refresh_token = if refresh_token.is_empty() {
+        existing.as_ref().and_then(|c| c.refresh_token.clone()).unwrap_or_default()
+    } else {
+        refresh_token.to_string()
+    };
+
+    // Secrets → `.env`; settings (channel, unlisted ids) → config.json.
+    cockatiel_client::write_env_file(
+        ".env",
+        &[
+            ("YOUTUBE_CHANNEL_ID", channel_id),
+            ("YOUTUBE_API_KEY", &serde_json::to_string(api_keys).unwrap_or_default()),
+            ("google_oauth_client_id", &oauth_client_id),
+            ("google_oauth_client_secret", &oauth_client_secret),
+            ("refresh_token", &refresh_token),
+        ],
+    );
+
     let path = PathBuf::from("config.json");
     let mut json_val = if let Ok(data) = std::fs::read_to_string(&path) {
         serde_json::from_str::<serde_json::Value>(&data).unwrap_or_else(|_| json!({}))
     } else {
         json!({})
     };
-
     let mut spec = json!({
         "channel_id": channel_id,
         "api_key": api_keys.first().cloned().unwrap_or_default(),
@@ -134,45 +305,185 @@ fn save_adapter_config(channel_id: &str, api_keys: &[String], unlisted_ids: &[St
     json_val["module_specific"] = spec;
     if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
         let _ = std::fs::write(&path, pretty);
-        info!("Successfully saved YouTube configuration to config.json");
+        info!("Successfully saved YouTube configuration (secrets → .env)");
     }
 }
 
-fn prompt_user(prompt_text: &str) -> String {
-    print!("{}", prompt_text);
-    io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .expect("Failed to read input");
-    input.trim().to_string()
+// ── OAuth2 token management (for sending to live chat) ────────────────
+
+/// Persist only the OAuth refresh token (a secret → `.env`), leaving
+/// channel/api keys untouched.
+fn save_oauth_refresh_token(refresh_token: &str) {
+    cockatiel_client::write_env_file(".env", &[("refresh_token", refresh_token)]);
 }
 
-fn prompt_api_keys() -> Vec<String> {
-    let mut keys = Vec::new();
-    println!("\n  API Keys: Enter up to 5 YouTube Data API Keys for automatic quota rotation.");
-    loop {
-        let key = prompt_user("    > Enter YouTube Data API Key 1 (required): ");
-        if !key.is_empty() {
-            keys.push(key);
-            break;
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const YT_FORCE_SSL: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
+const OAUTH_REDIRECT: &str = "http://localhost:3000";
+
+/// Manages a Google OAuth2 token for `youtube.force-ssl`: acquires a refresh
+/// token via the browser flow (or accepts one pasted into the config), then
+/// mints/refreshes short-lived access tokens on demand.
+#[derive(Clone)]
+struct OAuthManager {
+    client_id: String,
+    client_secret: String,
+    refresh_token: Arc<Mutex<Option<String>>>,
+    access_token: Arc<Mutex<Option<(String, Instant)>>>,
+}
+
+impl OAuthManager {
+    fn new(client_id: &str, client_secret: &str, refresh_token: Option<String>) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            refresh_token: Arc::new(Mutex::new(refresh_token)),
+            access_token: Arc::new(Mutex::new(None)),
         }
-        println!("    [Error]: Key 1 is required. Please provide a valid YouTube Data API Key.");
     }
 
-    for i in 2..=5 {
-        let key = prompt_user(&format!(
-            "    > Enter YouTube Data API Key {} (optional, press Enter to finish): ",
-            i
+    fn has_creds(&self) -> bool {
+        !self.client_id.is_empty() && !self.client_secret.is_empty()
+    }
+
+    fn set_refresh_token(&self, token: &str) {
+        *self.refresh_token.lock().unwrap() = Some(token.to_string());
+    }
+
+    /// Open the browser and capture the OAuth authorization code back on
+    /// localhost:3000 (Google uses a code, not a fragment).
+    async fn capture_code(&self, auth_url: &str) -> Result<String, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+            .await
+            .map_err(|e| format!("could not bind localhost:3000: {}", e))?;
+        let _ = open::that(auth_url);
+
+        let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let mut buf = [0; 8192];
+        let n = socket.read(&mut buf).await.map_err(|e| e.to_string())?;
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+        let ok_html = "<html><body style='background:#0e0e10;color:#efeff1;font-family:system-ui,sans-serif;text-align:center;padding-top:120px;'><h1 style='color:#a970ff;'>YouTube authorization successful!</h1><p>You can close this window.</p></body></html>";
+        let error_html = "<html><body style='background:#0e0e10;color:#efeff1;font-family:system-ui,sans-serif;text-align:center;padding-top:120px;'><h1 style='color:#ff4f4f;'>Authorization failed</h1></body></html>";
+
+        if request.contains("error=") {
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}", error_html);
+            let _ = socket.write_all(resp.as_bytes()).await;
+            return Err("Google OAuth returned an error".to_string());
+        }
+        // Extract ?code= from the GET request line.
+        if let Some(pos) = request.find("?code=") {
+            let start = pos + 6;
+            let end = request[start..].find(' ').unwrap_or(request[start..].len());
+            let code: String = request[start..start + end].chars().take_while(|c| *c != '&').collect();
+            if !code.is_empty() {
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}", ok_html);
+                let _ = socket.write_all(resp.as_bytes()).await;
+                return Ok(code);
+            }
+        }
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}", error_html);
+        let _ = socket.write_all(resp.as_bytes()).await;
+        Err("No authorization code in the redirect".to_string())
+    }
+
+    /// Run the browser flow to obtain a refresh token (and the first access
+    /// token). Requires `access_type=offline` + `prompt=consent` so a refresh
+    /// token is always returned.
+    async fn acquire_refresh_token(&self, client: &reqwest::Client) -> Result<String, String> {
+        let auth_url = format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
+            self.client_id,
+            OAUTH_REDIRECT,
+            urlencode(YT_FORCE_SSL)
+        );
+        let code = self.capture_code(&auth_url).await?;
+
+        let resp: serde_json::Value = client
+            .post(GOOGLE_TOKEN_URL)
+            .form(&[
+                ("code", code.as_str()),
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("redirect_uri", OAUTH_REDIRECT),
+                ("grant_type", "authorization_code"),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("token exchange failed: {}", e))?
+            .json()
+            .await
+            .map_err(|e| format!("token exchange parse failed: {}", e))?;
+
+        let refresh = resp
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("no refresh_token in response: {:?}", resp))?
+            .to_string();
+        let access = resp.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
+        let expires_in = resp.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+
+        self.set_refresh_token(&refresh);
+        if !access.is_empty() {
+            *self.access_token.lock().unwrap() = Some((access.to_string(), Instant::now() + std::time::Duration::from_secs(expires_in as u64 - 60)));
+        }
+        Ok(refresh)
+    }
+
+    /// Return a valid access token, refreshing from the refresh token when the
+    /// cached one is missing or about to expire.
+    async fn ensure_access_token(&self, client: &reqwest::Client) -> Result<String, String> {
+        if let Some((token, expiry)) = self.access_token.lock().unwrap().clone() {
+            if Instant::now() < expiry {
+                return Ok(token);
+            }
+        }
+
+        let refresh = self
+            .refresh_token
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no refresh token (configure Google OAuth client id/secret or a refresh token)".to_string())?;
+
+        let resp: serde_json::Value = client
+            .post(GOOGLE_TOKEN_URL)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("refresh_token", refresh.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("token refresh failed: {}", e))?
+            .json()
+            .await
+            .map_err(|e| format!("token refresh parse failed: {}", e))?;
+
+        let access = resp
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("no access_token in refresh response: {:?}", resp))?
+            .to_string();
+        let expires_in = resp.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+        *self.access_token.lock().unwrap() = Some((
+            access.clone(),
+            Instant::now() + std::time::Duration::from_secs(expires_in as u64 - 60),
         ));
-        if key.is_empty() {
-            break;
-        }
-        if !keys.contains(&key) {
-            keys.push(key);
+        Ok(access)
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
-    keys
+    out
 }
 
 /// Extracts an 11-character YouTube video ID from a raw ID or standard YouTube URL format
@@ -247,6 +558,7 @@ async fn fetch_video_stream(
     keys: &ApiKeyManager,
 ) -> Result<Option<StreamInfo>, Box<dyn std::error::Error>> {
     let max_attempts = keys.key_count().max(1);
+    let mut found: Option<StreamInfo> = None;
 
     for attempt in 0..max_attempts {
         let api_key = keys.current_key();
@@ -267,20 +579,15 @@ async fn fetch_video_stream(
             if attempt + 1 < max_attempts {
                 keys.rotate_to_next();
                 continue;
-            } else {
-                error!(
-                    "All {} configured YouTube API keys have exceeded their quota!",
-                    keys.key_count()
-                );
-                return Ok(None);
             }
+            break;
         }
 
         if let Some(err) = json.get("error") {
             if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
                 error!("YouTube API error fetching video {}: {}", video_id, msg);
             }
-            return Ok(None);
+            break;
         }
 
         if let Some(items) = json.get("items").and_then(|i| i.as_array()) {
@@ -306,35 +613,127 @@ async fn fetch_video_stream(
                     .unwrap_or("");
 
                 let details = item.get("liveStreamingDetails");
-                let is_ended = details
-                    .and_then(|l| l.get("actualEndTime"))
-                    .is_some();
+                let is_ended = details.and_then(|l| l.get("actualEndTime")).is_some();
 
                 if is_ended {
                     info!("Stream {} has already ended.", video_id);
-                    return Ok(None);
-                }
-
-                let status = if broadcast_content == "live" {
-                    "live".to_string()
-                } else if broadcast_content == "upcoming" || details.is_some() {
-                    "upcoming".to_string()
                 } else {
-                    "live".to_string()
-                };
+                    let status = if broadcast_content == "live" {
+                        "live".to_string()
+                    } else if broadcast_content == "upcoming" || details.is_some() {
+                        "upcoming".to_string()
+                    } else {
+                        "live".to_string()
+                    };
 
-                return Ok(Some(StreamInfo {
-                    video_id: video_id.to_string(),
-                    title,
-                    status,
-                    published_at,
-                }));
+                    found = Some(StreamInfo {
+                        video_id: video_id.to_string(),
+                        title,
+                        status,
+                        published_at,
+                    });
+                }
             }
         }
         break;
     }
 
-    Ok(None)
+    // Keyless fallback: scrape the watch page. Works without a valid Data API
+    // key and for Unlisted streams (Private/Draft remain unavailable even here).
+    if found.is_none() {
+        warn!(
+            "Data API lookup for {} failed (invalid/quota key?) — trying keyless watch-page scrape.",
+            video_id
+        );
+        found = fetch_video_from_watch_page(client, video_id).await?;
+    }
+
+    Ok(found)
+}
+
+/// Keyless fallback: parse the watch page's `ytInitialPlayerResponse` for the
+/// video's title + live/upcoming status. No Data API key required.
+async fn fetch_video_from_watch_page(
+    client: &reqwest::Client,
+    video_id: &str,
+) -> Result<Option<StreamInfo>, Box<dyn std::error::Error>> {
+    let url = format!("https://www.youtube.com/watch?v={}", video_id);
+    let res = client
+        .get(&url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await?;
+    let html = res.text().await?;
+
+    let marker = "var ytInitialPlayerResponse = ";
+    let Some(start) = html.find(marker) else {
+        info!(
+            "Watch page for {} has no ytInitialPlayerResponse (private/unavailable?).",
+            video_id
+        );
+        return Ok(None);
+    };
+    // Parse just the first JSON value after the marker; the page appends more
+    // JS (`;var meta = ...`), so a plain from_str would fail on the trailing data.
+    let json_str = &html[start + marker.len()..];
+    let mut de = serde_json::Deserializer::from_str(json_str);
+    let data: serde_json::Value = match serde_json::Value::deserialize(&mut de) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("ytInitialPlayerResponse parse failed for {}: {}", video_id, e);
+            return Ok(None);
+        }
+    };
+
+    if let Some(status) = data
+        .get("playabilityStatus")
+        .and_then(|p| p.get("status"))
+        .and_then(|s| s.as_str())
+    {
+        if status != "OK" {
+            info!(
+                "Video {} is not playable (status={}); not a public/unlisted stream.",
+                video_id, status
+            );
+            return Ok(None);
+        }
+    }
+
+    let Some(vd) = data.get("videoDetails") else {
+        return Ok(None);
+    };
+    let title = vd
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("Untitled Stream")
+        .to_string();
+    let is_live = vd.get("isLive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_live_details = vd.get("liveBroadcastDetails").is_some();
+    let is_upcoming = vd
+        .get("isUpcoming")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || (has_live_details && !is_live);
+    let published_at = vd
+        .get("publishDate")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if !is_live && !is_upcoming {
+        info!("Video {} is a regular VOD, not a live/upcoming stream.", video_id);
+        return Ok(None);
+    }
+
+    Ok(Some(StreamInfo {
+        video_id: video_id.to_string(),
+        title,
+        status: if is_live { "live" } else { "upcoming" }.to_string(),
+        published_at,
+    }))
 }
 
 /// Resolves a handle (e.g., @vulbyte or vulbyte), channel URL, or channel ID into an exact YouTube Channel ID (UC...)
@@ -626,6 +1025,79 @@ async fn fetch_channel_streams_web(
     streams
 }
 
+/// Keyless fallback: query YouTube's InnerTube browse API for the channel's
+/// Streams tab (live + scheduled + unlisted). Uses YouTube's own public web
+/// API — NO Data API key required — so it works even when the key is missing,
+/// invalid, or quota-exhausted, and it pins the exact Streams tab instead of
+/// relying on a scraped URL that may redirect to the channel home page.
+async fn fetch_channel_streams_inner(
+    client: &reqwest::Client,
+    channel_id: &str,
+) -> Vec<StreamInfo> {
+    let mut streams = Vec::new();
+    let url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false";
+    let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+    // Channels name their live tab either "Streams" or "Live" — try both params.
+    let tab_params = [
+        "EgZzdHJlYW1z",            // "Streams" tab
+        "EgdzdHJlYW1z8gYECgJ6AA==", // "Live" tab
+    ];
+
+    for params in &tab_params {
+        let body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20240718.01.00",
+                    "hl": "en",
+                    "gl": "US",
+                },
+            },
+            "browseId": channel_id,
+            "params": params,
+        });
+
+        let res = match client
+            .post(url)
+            .header("User-Agent", ua)
+            .header("Content-Type", "application/json")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .body(body.to_string())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("InnerTube browse request failed: {}", e);
+                continue;
+            }
+        };
+
+        match res.json::<serde_json::Value>().await {
+            Ok(json) => {
+                let before = streams.len();
+                extract_streams_from_json(&json, &mut streams);
+                let found = streams.len().saturating_sub(before);
+                if found > 0 {
+                    info!(
+                        "InnerTube discovery for {} found {} stream(s) (params={})",
+                        channel_id, found, params
+                    );
+                }
+            }
+            Err(e) => error!("InnerTube browse response parse failed: {}", e),
+        }
+    }
+
+    info!(
+        "InnerTube total streams-tab discovery for {} found {} stream(s)",
+        channel_id,
+        streams.len()
+    );
+    streams
+}
+
 async fn fetch_streams(
     client: &reqwest::Client,
     channel_id: &str,
@@ -739,9 +1211,91 @@ async fn fetch_streams(
                 all_streams.push(ws);
             }
         }
+
+        // 4. Keyless InnerTube streams-tab fallback (no API key, pins the exact tab).
+        let inner_streams = fetch_channel_streams_inner(client, channel_id).await;
+        for ws in inner_streams {
+            if !all_streams.iter().any(|s: &StreamInfo| s.video_id == ws.video_id) {
+                info!(
+                    "Discovered stream on channel streams tab (InnerTube): {} ({})",
+                    ws.title, ws.video_id
+                );
+                all_streams.push(ws);
+            }
+        }
     }
 
     Ok(all_streams)
+}
+
+/// Send a Prompt to the engine (forwarded to connected UIs) and wait for the
+/// operator's response (`PromptResponse.reason`). Returns None on cancel/timeout.
+async fn prompt_for_input(
+    write_ws: &mut WsWriteHalf,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    title: &str,
+    details: &str,
+    input_label: &str,
+    kind: PromptKind,
+    timeout: u32,
+) -> Option<String> {
+    let prompt_id = uuid::Uuid::now_v7().to_string();
+    let prompt_type = match kind {
+        PromptKind::Boolean => PromptType::Boolean,
+        PromptKind::String => PromptType::String,
+        PromptKind::Credential => PromptType::Credential,
+    };
+    let prompt = Prompt {
+        prompt_id_uuid7: prompt_id.clone(),
+        prompt: title.to_string(),
+        details: details.to_string(),
+        yes_dialog: "Submit".to_string(),
+        no_dialog: "Cancel".to_string(),
+        timeout,
+        origin: module_name.to_string(),
+        origin_uuid7: String::new(),
+        instructions: String::new(),
+        link: String::new(),
+        input_label: input_label.to_string(),
+        prompt_type: prompt_type as i32,
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth_token.to_string(),
+        module_name: module_name.to_string(),
+        module_instance_uuid7: instance_uuid.to_string(),
+        payload: Some(Payload::Prompt(prompt)),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_err() {
+        return None;
+    }
+    if write_ws.send(WsMessage::Binary(buf.into())).await.is_err() {
+        return None;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64 + 10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(10), prompt_rx.recv()).await {
+            Ok(Some(resp)) if resp.prompt_id_uuid7 == prompt_id => {
+                return if resp.accepted {
+                    Some(resp.reason)
+                } else {
+                    None
+                };
+            }
+            Ok(Some(_)) => continue, // a different prompt's response
+            Ok(None) => return None,
+            // The 10s poll interval elapsed with no response yet: keep waiting
+            // until the real deadline (the `timeout` seconds above), rather than
+            // bailing out 10 seconds in and auto-cancelling every prompt.
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 /// Prompts user to select a stream with a 30-second timeout fallback.
@@ -752,6 +1306,11 @@ async fn select_stream(
     keys: &ApiKeyManager,
     unlisted_ids: &mut Vec<String>,
     channel_id: &str,
+    write_ws: &mut WsWriteHalf,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
 ) -> Option<StreamInfo> {
     if streams.is_empty() {
         println!("\n==================================================");
@@ -761,49 +1320,52 @@ async fn select_stream(
             println!("  Channel ID: {}", channel_id);
         }
         println!("  Active Keys: {} API key(s) configured", keys.key_count());
-        println!("  NOTE ON YOUTUBE STREAM VISIBILITY:");
+        println!("  WHY A STREAM MAY NOT SHOW UP:");
+        println!("  * The stream must be FULLY SCHEDULED with a start time in");
+        println!("    YouTube Studio (Live > Manage) before it becomes visible.");
+        println!("  * Visibility must be Public or Unlisted. DRAFT and PRIVATE");
+        println!("    streams are invisible to every public discovery method.");
+        println!("  * Unlisted streams CANNOT be found via YouTube Search, but");
+        println!("    they DO show on the channel's Streams tab.");
         println!("  * Public scheduled streams may take a moment to appear.");
-        println!("  * Unlisted streams CANNOT be found via YouTube Search.");
-        println!("    Enter an Unlisted Stream URL or Video ID below to monitor it.");
-        println!("  * Private streams CANNOT be accessed with an API key (OAuth 2.0 required).");
-        println!("    Please set stream visibility to Unlisted or Public in YouTube Studio.");
+        println!("  You can also monitor a stream directly by entering its");
+        println!("  Video ID or URL below.");
         println!("==================================================\n");
-        print!("    > Enter Unlisted Video ID or URL (or press Enter to re-scan in 30s): ");
-        io::stdout().flush().unwrap();
-
-        let stdin_future = tokio::task::spawn_blocking(|| {
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok() {
-                Some(input.trim().to_string())
-            } else {
-                None
-            }
-        });
-
-        match tokio::time::timeout(tokio::time::Duration::from_secs(30), stdin_future).await {
-            Ok(Ok(Some(input))) if !input.is_empty() => {
-                if let Some(vid) = extract_video_id(&input) {
-                    info!("Fetching unlisted stream metadata for Video ID: {}", vid);
-                    match fetch_video_stream(client, &vid, keys).await {
-                        Ok(Some(stream)) => {
-                            if !unlisted_ids.contains(&vid) {
-                                unlisted_ids.push(vid);
-                                save_adapter_config(channel_id, keys.get_all_keys(), unlisted_ids);
-                            }
-                            return Some(stream);
+        // Ask the operator (via a Prompt) for an unlisted video id.
+        let input = prompt_for_input(
+            write_ws,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "No active streams found",
+            "No live or scheduled stream was found for this channel.\n\nWhy? The stream must be fully scheduled (with a start time) AND Public or Unlisted in YouTube Studio. Draft and Private streams are invisible to every public discovery method (Search API, channel page, InnerTube). Unlisted streams won't appear in Search, but they DO show on the channel's Streams tab.\n\nEnter the Video ID or URL to monitor it directly, or cancel to keep scanning.",
+            "Video ID or URL",
+            PromptKind::String,
+            120,
+        )
+        .await;
+        if let Some(input) = input {
+            if let Some(vid) = extract_video_id(&input) {
+                info!("Fetching unlisted stream metadata for Video ID: {}", vid);
+                match fetch_video_stream(client, &vid, keys).await {
+                    Ok(Some(stream)) => {
+                        if !unlisted_ids.contains(&vid) {
+                            unlisted_ids.push(vid);
+                            save_adapter_config(channel_id, keys.get_all_keys(), unlisted_ids, "", "", "");
                         }
-                        Ok(None) => {
-                            warn!("Video ID {} was not found or is private.", vid);
-                        }
-                        Err(e) => {
-                            error!("Error fetching video {}: {}", vid, e);
-                        }
+                        return Some(stream);
                     }
-                } else {
-                    warn!("Invalid YouTube Video ID or URL format: {}", input);
+                    Ok(None) => {
+                        warn!("Video ID {} was not found or is private.", vid);
+                    }
+                    Err(e) => {
+                        error!("Error fetching video {}: {}", vid, e);
+                    }
                 }
+            } else {
+                warn!("Invalid YouTube Video ID or URL format: {}", input);
             }
-            _ => {}
         }
 
         return None;
@@ -829,49 +1391,64 @@ async fn select_stream(
     println!("\n    > Enter a stream number [1-{}].", streams.len());
     println!("    > Or enter 'u' to monitor an Unlisted Stream URL/Video ID.");
     println!("    > If no selection is made, the newest stream will be auto-selected.\n");
-    print!("    > Select stream [1-{}]: ", streams.len());
-    io::stdout().flush().unwrap();
 
-    let stdin_future = tokio::task::spawn_blocking(|| {
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok() {
-            Some(input.trim().to_string())
-        } else {
-            None
-        }
-    });
-
-    let input_res =
-        match tokio::time::timeout(tokio::time::Duration::from_secs(30), stdin_future).await {
-            Ok(Ok(Some(input))) if !input.is_empty() => Some(input),
-            _ => {
-                println!("\n    [Timeout]: No selection made within 30 seconds. Auto-selecting...");
-                None
-            }
-        };
+    // Ask the operator (via a Prompt) for a selection.
+    let mut details = format!("Select a stream to monitor.\n\n");
+    for (i, stream) in streams.iter().enumerate() {
+        details.push_str(&format!("{}: {} ({})\n", i + 1, stream.title, stream.video_id));
+    }
+    details.push_str("\nEnter a stream number, 'u' for an unlisted video, or leave empty to auto-select.");
+    let input_res = prompt_for_input(
+        write_ws,
+        prompt_rx,
+        auth_token,
+        module_name,
+        instance_uuid,
+        "Select a stream",
+        &details,
+        "Stream number (or 'u')",
+        PromptKind::String,
+        120,
+    )
+    .await;
 
     if let Some(user_input) = input_res {
+        let user_input = user_input.trim().to_string();
         if user_input.to_lowercase() == "u" {
-            let unlisted_input = prompt_user("    > Enter Unlisted Video ID or URL: ");
-            if let Some(vid) = extract_video_id(&unlisted_input) {
-                info!("Fetching unlisted stream metadata for Video ID: {}", vid);
-                match fetch_video_stream(client, &vid, keys).await {
-                    Ok(Some(stream)) => {
-                        if !unlisted_ids.contains(&vid) {
-                            unlisted_ids.push(vid);
-                            save_adapter_config(channel_id, keys.get_all_keys(), unlisted_ids);
+            let unlisted_input = prompt_for_input(
+                write_ws,
+                prompt_rx,
+                auth_token,
+                module_name,
+                instance_uuid,
+                "Monitor an unlisted video",
+                "Enter an Unlisted Video ID or URL to monitor it.",
+                "Unlisted Video ID or URL",
+                PromptKind::String,
+                120,
+            )
+            .await;
+            if let Some(unlisted_input) = unlisted_input {
+                if let Some(vid) = extract_video_id(&unlisted_input) {
+                    info!("Fetching unlisted stream metadata for Video ID: {}", vid);
+                    match fetch_video_stream(client, &vid, keys).await {
+                        Ok(Some(stream)) => {
+                            if !unlisted_ids.contains(&vid) {
+                                unlisted_ids.push(vid);
+                                save_adapter_config(channel_id, keys.get_all_keys(), unlisted_ids, "", "", "");
+                            }
+                            return Some(stream);
                         }
-                        return Some(stream);
+                        Ok(None) => {
+                            warn!("Video ID {} was not found or is private.", vid);
+                        }
+                        Err(e) => {
+                            error!("Error fetching video {}: {}", vid, e);
+                        }
                     }
-                    Ok(None) => {
-                        warn!("Video ID {} was not found or is private.", vid);
-                    }
-                    Err(e) => {
-                        error!("Error fetching video {}: {}", vid, e);
-                    }
+                } else {
+                    warn!("Invalid YouTube Video ID or URL format: {}", unlisted_input);
                 }
-            } else {
-                warn!("Invalid YouTube Video ID or URL format: {}", unlisted_input);
             }
         } else if let Ok(num) = user_input.parse::<usize>() {
             if num > 0 && num <= streams.len() {
@@ -900,61 +1477,97 @@ async fn select_stream(
 }
 
 /// Polls live chat for the selected stream until it ends, with automatic key rotation on quota limits
+/// Post a message to the active live chat using the OAuth access token.
+async fn send_to_youtube(
+    oauth: &OAuthManager,
+    client: &reqwest::Client,
+    live_chat: &Arc<Mutex<Option<String>>>,
+    msg: &str,
+) -> Result<(), String> {
+    let chat_id = live_chat
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "no active live chat to send to".to_string())?;
+    let access = oauth.ensure_access_token(client).await?;
+
+    let body = json!({
+        "snippet": {
+            "liveChatId": chat_id,
+            "type": "textMessageEvent",
+            "textMessageDetails": { "messageText": msg },
+        }
+    });
+    let resp = client
+        .post("https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet")
+        .bearer_auth(&access)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("send request failed: {}", e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(format!("YouTube API {}: {}", status, text))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
-    cockatiel: &CockatielClient,
+    write_ws: &mut WsWriteHalf,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
     client: &reqwest::Client,
     video_id: &str,
     keys: &ApiKeyManager,
+    live_chat: &Arc<Mutex<Option<String>>>,
 ) {
-    let mut attempts = 0;
+    let mut attempt = 0u32;
     let chat_id = 'found_chat: loop {
-        attempts += 1;
-        if attempts > 10 {
-            info!("Live chat failed to open or stream has concluded. Returning to stream discovery...");
+        attempt += 1;
+        if attempt > 60 {
+            info!("Live chat failed to open after extended monitoring. Returning to stream discovery...");
             return;
         }
 
-        let max_key_rotations = keys.key_count().max(1);
-        let mut got_response = false;
+        // 1. Try the Data API first (works with a valid key).
+        let mut got_live_chat_id = false;
+        let mut stream_ended = false;
+        let api_key = keys.current_key();
+        let video_url = format!(
+            "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails,status&id={}&key={}",
+            video_id, api_key
+        );
 
-        for _ in 0..max_key_rotations {
-            let api_key = keys.current_key();
-            let video_url = format!(
-                "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails,status&id={}&key={}",
-                video_id, api_key
-            );
-
-            match client.get(&video_url).send().await {
-                Ok(res) => {
-                    if let Ok(json) = res.json::<serde_json::Value>().await {
-                        if ApiKeyManager::is_quota_error(&json) {
-                            warn!("API key quota exceeded while checking video status. Rotating API key...");
-                            keys.rotate_to_next();
-                            continue;
-                        }
+        match client.get(&video_url).send().await {
+            Ok(res) => {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    if !ApiKeyManager::is_quota_error(&json) {
                         if let Some(err) = json.get("error") {
-                            error!("Error checking video status from YouTube API: {:?}", err);
+                            // API key invalid or other error — fall through to watch-page check.
+                            if attempt == 1 {
+                                warn!("Data API unavailable for video status: {:?} — using watch-page fallback.", err.get("message").and_then(|m|m.as_str()).unwrap_or("unknown"));
+                            }
                         }
                         if let Some(items) = json.get("items").and_then(|i| i.as_array()) {
                             if let Some(item) = items.first() {
-                                got_response = true;
                                 if let Some(status) = item
                                     .get("status")
                                     .and_then(|s| s.get("uploadStatus"))
                                     .and_then(|u| u.as_str())
                                 {
-                                    if status == "processed"
-                                        || status == "deleted"
-                                        || status == "rejected"
-                                    {
+                                    if status == "processed" || status == "deleted" || status == "rejected" {
                                         info!("Stream has ended.");
                                         return;
                                     }
                                 }
                                 if let Some(details) = item.get("liveStreamingDetails") {
-                                    if let Some(id) =
-                                        details.get("activeLiveChatId").and_then(|c| c.as_str())
-                                    {
+                                    if let Some(id) = details.get("activeLiveChatId").and_then(|c| c.as_str()) {
+                                        *live_chat.lock().unwrap() = Some(id.to_string());
                                         break 'found_chat id.to_string();
                                     }
                                     if details.get("actualEndTime").is_some() {
@@ -964,19 +1577,40 @@ async fn monitor_stream_chat(
                                 }
                             }
                         }
+                    } else if attempt == 1 {
+                        warn!("Data API quota exhausted — using watch-page fallback for stream status.");
                     }
                 }
-                Err(e) => {
-                    error!("Error checking video status: {}", e);
-                }
             }
-            break;
+            Err(_) => {}
         }
 
-        if !got_response {
-            info!("Waiting for live chat to start for video {}...", video_id);
+        // 2. Keyless watch-page fallback: check isLive / isUpcoming.
+        if let Ok(Some(stream_info)) = fetch_video_from_watch_page(client, video_id).await {
+            if stream_info.status == "live" {
+                // Stream is live but we can't get the chat ID without the Data API.
+                // Log once and keep trying — the chat ID might become available if
+                // the user provides a real API key later.
+                if attempt % 5 == 1 {
+                    warn!(
+                        "Stream is LIVE but Data API unavailable to get live chat ID. \
+                         Add a real YouTube Data API key to enable chat monitoring."
+                    );
+                }
+            } else {
+                // Upcoming — wait and retry.
+                if attempt % 6 == 1 {
+                    info!(
+                        "Stream '{}' is upcoming ({}). Waiting for it to go live...",
+                        stream_info.title, stream_info.status
+                    );
+                }
+            }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        // Exponential-ish backoff: 10s for the first few attempts, then 30s.
+        let delay = if attempt < 6 { 10 } else { 30 };
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
     };
 
     info!(
@@ -1065,15 +1699,52 @@ async fn monitor_stream_chat(
                             if !msg.is_empty() {
                                 info!("[YouTube Chat] {}: {}", author, msg);
                                 let pre_process = MessagePreProcess {
-                                    platform: "youtube".to_string(),
-                                    raw_data: item.to_string(),
-                                    raw_message: msg.to_string(),
+                        audio: vec![],
+                        audio_type: String::new(),
+                                    message_uuid7: String::new(),
+                                    raw_message: Some(ChatMessage {
+                                        platform: "youtube".into(),
+                                        raw_data: item.to_string().as_bytes().to_vec(),
+                                        raw_message: msg.to_string(),
+                                        user_uuid7: author.to_string(),
+                                        command: None,
+                                        user_data: None,
+                                    }),
                                 };
-                                if let Err(e) = cockatiel
-                                    .send("incoming_chat", Payload::MessagePreProcess(pre_process))
-                                    .await
-                                {
-                                    error!("Failed to send message to engine: {}", e);
+                                let container = Container {
+                                    version: 1,
+                                    auth_token: auth_token.to_string(),
+                                    module_name: module_name.to_string(),
+                                    module_instance_uuid7: instance_uuid.to_string(),
+                                    payload: Some(Payload::MessagePreProcess(pre_process)),
+                                };
+                                let mut buf = Vec::new();
+                                if container.encode(&mut buf).is_ok() {
+                                    if let Err(e) = write_ws.send(WsMessage::Binary(buf.into())).await {
+                                        error!("Failed to send to engine: {}", e);
+                                    }
+                                }
+
+                                // Handle moderator commands (!ban / !timeout).
+                                if let Some((qid, payload)) = parse_mod_command(msg, author) {
+                                    info!("Mod command detected: {} payload={}", qid, payload);
+                                    let query = Container {
+                                        version: 1,
+                                        auth_token: auth_token.to_string(),
+                                        module_name: module_name.to_string(),
+                                        module_instance_uuid7: instance_uuid.to_string(),
+                                        payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                            query_id: qid,
+                                            sql: payload.to_string(),
+                                            params: vec![],
+                                        })),
+                                    };
+                                    let mut qbuf = Vec::new();
+                                    if query.encode(&mut qbuf).is_ok() {
+                                        if let Err(e) = write_ws.send(WsMessage::Binary(qbuf.into())).await {
+                                            error!("Failed to send mod command to engine: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1102,42 +1773,158 @@ async fn monitor_stream_chat(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     info!("Starting YouTube Adapter Module...");
 
-    let cockatiel = CockatielClient::connect("youtube_adapter")
-        .position("input")
-        .connect()
-        .await?;
+    let cockatiel = CockatielClient::connect("config.json").await?;
 
-    let cockatiel_listener = cockatiel.clone();
-    tokio::spawn(async move {
-        if let Err(e) = cockatiel_listener
-            .receive(|container| match container.r#type.as_str() {
-                "send" => info!("Received send: {:?}", container),
-                "engine_message" => info!("Received engine message: {:?}", container),
-                other => tracing::trace!("Ignoring type={}", other),
-            })
-            .await
+    let auth_token = cockatiel.auth_token.clone();
+    let instance_uuid = cockatiel.instance_uuid7.clone();
+    let module_name = cockatiel.config.module_name.clone();
+    let (write_ws_cockatiel, mut read_ws_cockatiel) = cockatiel.stream.split();
+    let write_ws_cockatiel = Arc::new(tokio::sync::Mutex::new(write_ws_cockatiel));
+
+    // HTTP client (HTTP/1.1: reqwest's default HTTP/2 negotiation against
+    // googleapis is flaky and produced "connection closed before message
+    // completed" errors).
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    // OAuth for sending: load app creds + any saved refresh token.
+    let saved_cfg = load_adapter_config();
+    let oauth_client_id = saved_cfg.as_ref().and_then(|c| c.google_oauth_client_id.clone()).unwrap_or_default();
+    let oauth_client_secret = saved_cfg.as_ref().and_then(|c| c.google_oauth_client_secret.clone()).unwrap_or_default();
+    let oauth_refresh = saved_cfg.as_ref().and_then(|c| c.refresh_token.clone()).unwrap_or_default();
+    let oauth = OAuthManager::new(
+        &oauth_client_id,
+        &oauth_client_secret,
+        if oauth_refresh.is_empty() {
+            None
+        } else {
+            Some(oauth_refresh.clone())
+        },
+    );
+
+    // The live chat id currently being monitored (shared with the send task).
+    let live_chat: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // If we have OAuth app credentials but no refresh token yet, acquire one
+    // now via the browser flow (bounded so it can never hang forever).
+    if oauth.has_creds() && oauth_refresh.is_empty() {
+        info!("No YouTube refresh token yet — opening browser to authorize sending...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            oauth.acquire_refresh_token(&client),
+        )
+        .await
         {
-            error!("Receiver error: {}", e);
+            Ok(Ok(refresh)) => {
+                info!("Acquired YouTube refresh token (sending enabled).");
+                save_oauth_refresh_token(&refresh);
+            }
+            Ok(Err(e)) => warn!("Could not acquire YouTube OAuth token ({}); sending disabled.", e),
+            Err(_) => warn!("YouTube OAuth capture timed out; sending disabled."),
+        }
+    } else if oauth.has_creds() {
+        info!("YouTube OAuth refresh token present (sending enabled).");
+    } else if oauth_refresh.is_empty() {
+        warn!("YouTube sending disabled: set Google OAuth client id/secret (or a refresh token) in the credential form.");
+    }
+
+    let oauth_task = oauth.clone();
+    let client_task = client.clone();
+    let live_chat_task = Arc::clone(&live_chat);
+    // Channel carrying PromptResponses from the engine to the stream loop,
+    // so `prompt_for_input` can await the operator's typed answer.
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
+    let prompt_tx_task = prompt_tx.clone();
+    let write_task = write_ws_cockatiel.clone();
+    let auth_task = auth_token.clone();
+    let module_task = module_name.clone();
+    let instance_task = instance_uuid.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = read_ws_cockatiel.next().await {
+            match msg {
+                Ok(WsMessage::Binary(data)) => {
+                    if let Ok(container) = Container::decode(data.as_ref()) {
+                        info!(
+                            "Received from engine: {:?}",
+                            container
+                                .payload
+                                .as_ref()
+                                .map(|p| std::mem::discriminant(p))
+                        );
+
+                        // Answer the engine's liveness probe with our auth token
+                        // so a quiet period never severs us.
+                        if let Some(Payload::AuthVerify(_)) = container.payload {
+                            let reply = Container {
+                                version: 1,
+                                auth_token: auth_task.clone(),
+                                module_name: module_task.clone(),
+                                module_instance_uuid7: instance_task.clone(),
+                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                    cur_auth: auth_task.clone(),
+                                })),
+                            };
+                            let mut buf = Vec::new();
+                            if reply.encode(&mut buf).is_ok() {
+                                let mut w = write_task.lock().await;
+                                let _ = w.send(WsMessage::Binary(buf.into())).await;
+                            }
+                        }
+                        // SendToPlatforms handling: post to the active live chat.
+                        else if let Some(Payload::SendToPlatforms(send)) = container.payload {
+                            match send_to_youtube(&oauth_task, &client_task, &live_chat_task, &send.msg).await {
+                                Ok(()) => info!("Sent to YouTube live chat: {}", send.msg),
+                                Err(e) => error!("SendToPlatforms failed: {}", e),
+                            }
+                        } else if let Some(Payload::PromptResponse(resp)) = container.payload {
+                            // Forward operator answers to the awaiting prompt.
+                            let _ = prompt_tx_task.send(resp);
+                        }
+                    }
+                }
+                Ok(WsMessage::Close(_)) => {
+                    info!("Engine closed connection");
+                    break;
+                }
+                Err(e) => {
+                    error!("Engine WebSocket error: {}", e);
+                    break;
+                }
+                _ => {}
+            }
         }
     });
 
-    let mut channel_input = std::env::var("YOUTUBE_CHANNEL_ID").unwrap_or_default();
-    let mut api_keys: Vec<String> = Vec::new();
-    let mut unlisted_ids: Vec<String> = Vec::new();
+    // Re-acquire credentials whenever YouTube rejects them (bad channel/API key).
+    cockatiel_client::load_env_file(".env");
+    'configure: loop {
+        let mut channel_input = std::env::var("YOUTUBE_CHANNEL_ID").unwrap_or_default();
+        let mut api_keys: Vec<String> = Vec::new();
+        let mut unlisted_ids: Vec<String> = Vec::new();
 
-    if let Ok(env_key) = std::env::var("YOUTUBE_API_KEY") {
-        let trimmed = env_key.trim().to_string();
-        if !trimmed.is_empty() {
-            api_keys.push(trimmed);
+        if let Ok(env_key) = std::env::var("YOUTUBE_API_KEY") {
+            // load_env_file joins list values with "\n"; accept either a single
+            // key or several.
+            for part in env_key.split('\n') {
+                let trimmed = part.trim().to_string();
+                if !trimmed.is_empty() {
+                    api_keys.push(trimmed);
+                }
+            }
         }
-    }
 
     if channel_input.is_empty() || api_keys.is_empty() {
+        // Non-interactive fast path: if a complete saved config exists, use it
+        // without prompting (enables the TUI to supply credentials via file).
         if let Some(saved) = load_adapter_config() {
             if let Some(saved_chan) = saved.channel_id {
                 let mut saved_keys = Vec::new();
@@ -1156,20 +1943,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if !saved_keys.is_empty() {
-                    println!("\n==================================================");
-                    println!("        Saved YouTube Configuration Found          ");
-                    println!("==================================================\n");
-                    let choice = prompt_user(&format!(
-                        "    > Use existing channel ID/handle '{}' with {} saved API key(s)? (y/n): ",
-                        saved_chan,
-                        saved_keys.len()
-                    ));
-                    if choice.to_lowercase() == "y" || choice.to_lowercase() == "yes" {
-                        channel_input = saved_chan;
-                        api_keys = saved_keys;
-                        if let Some(saved_unlisted) = saved.unlisted_video_ids {
-                            unlisted_ids = saved_unlisted;
+                if !saved_chan.is_empty() && !saved_keys.is_empty() && channel_input.is_empty() && api_keys.is_empty() {
+                    info!(
+                        "Using complete saved YouTube configuration for channel '{}' (no prompt).",
+                        saved_chan
+                    );
+                    channel_input = saved_chan;
+                    api_keys = saved_keys;
+                    if let Some(saved_unlisted) = saved.unlisted_video_ids {
+                        unlisted_ids = saved_unlisted;
+                    }
+                } else if !saved_keys.is_empty() {
+                    let confirm = prompt_for_input(
+                        &mut *write_ws_cockatiel.lock().await,
+                        &mut prompt_rx,
+                        &auth_token,
+                        &module_name,
+                        &instance_uuid,
+                        "Use Saved YouTube Configuration?",
+                        &format!(
+                            "A saved configuration was found:\n\n\
+                             Channel: {}\n\
+                             API key(s): {}\n\n\
+                             Use this configuration?",
+                            saved_chan,
+                            saved_keys.len()
+                        ),
+                        // Empty input_label + boolean kind → true y/n prompt (y accepts, n/Esc
+                        // cancels). The caller treats Some(..) as "yes".
+                        "",
+                        PromptKind::Boolean,
+                        120,
+                    )
+                    .await;
+                    if let Some(choice) = confirm {
+                        if choice.trim().eq_ignore_ascii_case("y") || choice.trim().eq_ignore_ascii_case("yes") {
+                            channel_input = saved_chan;
+                            api_keys = saved_keys;
+                            if let Some(saved_unlisted) = saved.unlisted_video_ids {
+                                unlisted_ids = saved_unlisted;
+                            }
                         }
                     }
                 }
@@ -1178,27 +1991,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if channel_input.is_empty() {
-        println!("\n==================================================");
-        println!("   YouTube Live Chat Configuration Required    ");
-        println!("==================================================\n");
-        println!("  You can enter a Channel Handle (e.g. @vulbyte), Channel ID (UC...),");
-        println!("  or a direct Video ID / Stream URL (for unlisted streams).\n");
-        channel_input = prompt_user("    > Enter YouTube Channel Handle, Channel ID, or Stream URL: ");
+        let input = prompt_for_input(
+            &mut *write_ws_cockatiel.lock().await,
+            &mut prompt_rx,
+            &auth_token,
+            &module_name,
+            &instance_uuid,
+            "YouTube Channel Configuration",
+            "Enter your YouTube Channel Handle (e.g. @vulbyte), Channel ID (UC...),\n\
+             or a direct Video ID / Stream URL (for unlisted streams).",
+            "Channel Handle, ID, or Video URL",
+            PromptKind::String,
+            300,
+        )
+        .await;
+        if let Some(val) = input {
+            channel_input = val.trim().to_string();
+        }
     }
 
     if api_keys.is_empty() {
-        api_keys = prompt_api_keys();
+        let input = prompt_for_input(
+            &mut *write_ws_cockatiel.lock().await,
+            &mut prompt_rx,
+            &auth_token,
+            &module_name,
+            &instance_uuid,
+            "YouTube API Key Required",
+            "Enter a YouTube Data API Key for stream discovery and chat monitoring.\n\n\
+             To get a key:\n\
+             1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
+             2. Create an API key\n\
+             3. Enable the YouTube Data API v3\n\n\
+             You can add additional keys later for quota rotation by editing\n\
+             config.json. Press Cancel to skip (discovery will still work\n\
+             via InnerTube, but chat monitoring won't).",
+            "YouTube Data API Key",
+            PromptKind::Credential,
+            300,
+        )
+        .await;
+        if let Some(key) = input {
+            let trimmed = key.trim().to_string();
+            if !trimmed.is_empty() {
+                api_keys.push(trimmed);
+                save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
+            }
+        }
         println!();
-        save_adapter_config(&channel_input, &api_keys, &unlisted_ids);
     }
 
-    let key_manager = ApiKeyManager::new(api_keys.clone());
+    let mut key_manager = ApiKeyManager::new(api_keys.clone());
     info!(
         "Initialized YouTube API Key Manager with {} key(s) for automatic rotation",
         key_manager.key_count()
     );
 
-    let client = reqwest::Client::new();
+    // ── Validate the API key early ──────────────────────────────────────
+    // If the key is invalid (e.g. the placeholder "testkey"), prompt the
+    // user to enter a real key via the TUI prompt dialog so they never have
+    // to manually edit a config file.
+    if !is_api_key_valid(&client, &key_manager).await {
+        warn!("YouTube API key is invalid or missing. Prompting user for a valid key...");
+        let new_key = prompt_for_input(
+            &mut *write_ws_cockatiel.lock().await,
+            &mut prompt_rx,
+            &auth_token,
+            &module_name,
+            &instance_uuid,
+            "YouTube API Key Required",
+            "Your YouTube Data API key is invalid or missing.\n\n\
+             Stream discovery will still work without a key (via InnerTube),\n\
+             but live chat monitoring requires a valid key.\n\n\
+             To get a key:\n\
+             1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
+             2. Create an API key\n\
+             3. Enable the YouTube Data API v3\n\n\
+             Enter your API key below, or press Cancel to continue\n\
+             without chat monitoring (discovery only).",
+            "YouTube Data API Key",
+            PromptKind::Credential,
+            300,
+        )
+        .await;
+
+        if let Some(key) = new_key {
+            let trimmed = key.trim().to_string();
+            if !trimmed.is_empty() {
+                api_keys = vec![trimmed];
+                key_manager = ApiKeyManager::new(api_keys.clone());
+                save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
+                info!("YouTube API key updated and saved to config.json");
+                // Re-validate immediately so we catch typos before entering the
+                // discovery loop.
+                if !is_api_key_valid(&client, &key_manager).await {
+                    warn!(
+                        "The key you entered still fails validation. \
+                         You can re-enter it by restarting the module."
+                    );
+                }
+            }
+        } else {
+            info!("No API key provided — continuing with discovery-only mode (InnerTube).");
+        }
+    }
+
     let maybe_video_id = extract_video_id(&channel_input);
 
     let channel_id = if let Some(ref vid) = maybe_video_id {
@@ -1211,24 +2108,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match get_channel_id(&client, &channel_input, &key_manager).await {
             Ok(cid) => {
                 if cid != channel_input && cid.starts_with("UC") {
-                    save_adapter_config(&cid, &api_keys, &unlisted_ids);
+                    save_adapter_config(&cid, &api_keys, &unlisted_ids, "", "", "");
                 }
                 cid
             }
             Err(e) => {
-                error!("{}", e);
-                channel_input.clone()
+                error!("Failed to resolve YouTube channel '{}': {}. Re-acquiring credentials...", channel_input, e);
+                channel_input.clear();
+                api_keys.clear();
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                continue 'configure;
             }
         }
     };
 
-    // Initialize gRPC transport layer connection
-    let _channel = tonic::transport::Channel::from_static("https://youtube.googleapis.com")
-        .tls_config(ClientTlsConfig::new())?
-        .connect()
-        .await?;
-
-    info!("Successfully connected to YouTube gRPC transport layer!");
+    // Initialize gRPC transport layer connection. The channel is currently
+// unused (discarded), so this is best-effort and MUST NOT block chat
+// discovery — a gRPC failure just logs a warning and we continue with the
+// REST API polling.
+match tonic::transport::Channel::from_static("https://youtube.googleapis.com")
+    .tls_config(ClientTlsConfig::new())
+{
+    Ok(ch) => {
+        if let Err(e) = ch.connect().await {
+            warn!(
+                "YouTube gRPC transport unavailable ({}); continuing with REST API",
+                e
+            );
+        } else {
+            info!("Successfully connected to YouTube gRPC transport layer!");
+        }
+    }
+    Err(e) => {
+        warn!(
+            "YouTube gRPC transport config failed ({}); continuing with REST API",
+            e
+        );
+    }
+}
 
     // Seamless loop: when a stream ends or disconnects, it automatically loops back to discover new streams
     loop {
@@ -1261,6 +2178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &key_manager,
             &mut unlisted_ids,
             &channel_id,
+            &mut *write_ws_cockatiel.lock().await,
+            &mut prompt_rx,
+            &auth_token,
+            &module_name,
+            &instance_uuid,
         )
         .await
         {
@@ -1278,9 +2200,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // Monitor stream live chat until the stream ends
-        monitor_stream_chat(&cockatiel, &client, &chosen_stream.video_id, &key_manager).await;
+        monitor_stream_chat(
+            &mut *write_ws_cockatiel.lock().await,
+            &auth_token,
+            &module_name,
+            &instance_uuid,
+            &client,
+            &chosen_stream.video_id,
+            &key_manager,
+            &live_chat,
+        )
+        .await;
 
         info!("Stream finished. Restarting discovery loop for seamless transition...");
+        }
     }
 }
 

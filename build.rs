@@ -1,5 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=../../proto/youtube_stream_list.proto");
+    let proto_dir = "../../cockatiel_engine-rs/cockatiel_lib/cockatiel_proto";
+    println!("cargo:rerun-if-changed={}/youtube_stream_list.proto", proto_dir);
 
     tonic_build::configure()
         .build_server(false)
@@ -8,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "youtube.api.v3.LiveChatGiftDetails.gift_duration",
             "#[serde(skip)]",
         )
-        .compile(&["../../proto/youtube_stream_list.proto"], &["../../proto"])?;
+        .compile_protos(&[format!("{}/youtube_stream_list.proto", proto_dir)], &[proto_dir])?;
 
     Ok(())
 }

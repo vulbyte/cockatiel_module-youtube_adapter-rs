@@ -1,12 +1,82 @@
 {
-    "name": "youtube-adapter", 
-    "description": "a module for getting and sending messages to youtube",
-    "version": "0.1.0", 
-    "capabilities": "input",    
-    "root_file": "./src/main.rs",
-    "launch_command": "cargo run",
-    "command_flags": [
-        " --release"
-    ],
-    "autostart": true
+  "name": "youtube-adapter",
+  "description": "a module for getting and sending messages to youtube",
+  "version": "0.1.0",
+  "capabilities": "input",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo run",
+  "command_flags": [
+    "--release"
+  ],
+  "autostart": true,
+  "credentials": [
+    {
+      "key": "channel_id",
+      "label": "Channel ID / Handle",
+      "sensitive": false,
+      "list": false,
+      "env": ""
+    },
+    {
+      "key": "api_keys",
+      "label": "API Keys (one per line)",
+      "sensitive": true,
+      "list": true,
+      "env": "YOUTUBE_API_KEY"
+    },
+    {
+      "key": "unlisted_video_ids",
+      "label": "Unlisted Video IDs",
+      "sensitive": false,
+      "list": true,
+      "optional": true,
+      "env": ""
+    },
+    {
+      "key": "google_oauth_client_id",
+      "label": "Google OAuth Client ID (console.cloud.google.com)",
+      "sensitive": true,
+      "list": false,
+      "optional": true,
+      "env": "google_oauth_client_id"
+    },
+    {
+      "key": "google_oauth_client_secret",
+      "label": "Google OAuth Client Secret",
+      "sensitive": true,
+      "list": false,
+      "optional": true,
+      "env": "google_oauth_client_secret"
+    },
+    {
+      "key": "refresh_token",
+      "label": "Google OAuth Refresh Token (optional; auto-acquired)",
+      "sensitive": true,
+      "list": false,
+      "optional": true,
+      "env": "refresh_token"
+    }
+  ],
+  "binary": {
+    "macos": {
+      "x86_64": "target/release/youtube-adapter-rs",
+      "aarch64": "target/release/youtube-adapter-rs",
+      "arm": "target/release/youtube-adapter-rs"
+    },
+    "linux": {
+      "x86_64": "target/release/youtube-adapter-rs",
+      "aarch64": "target/release/youtube-adapter-rs",
+      "arm": "target/release/youtube-adapter-rs"
+    },
+    "windows": {
+      "x86_64": "target/release/youtube-adapter-rs.exe",
+      "aarch64": "target/release/youtube-adapter-rs.exe",
+      "arm": "target/release/youtube-adapter-rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ]
 }
