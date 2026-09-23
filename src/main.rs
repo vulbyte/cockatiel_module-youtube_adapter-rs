@@ -1732,6 +1732,7 @@ async fn monitor_stream_chat(
                                         raw_message: msg.to_string(),
                                         user_uuid7: author.to_string(),
                                         command: None,
+                                        channel_id: live_chat.lock().unwrap().clone().unwrap_or_default(),
                                         user_data: None,
                                     }),
                                 };
