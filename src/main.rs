@@ -140,69 +140,65 @@ async fn is_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> boo
     }
 }
 
-/// Parse a moderator command (!ban / !timeout) from a chat message.
-fn parse_mod_command(message: &str, author: &str) -> Option<(String, serde_json::Value)> {
-    let trimmed = message.trim();
-    let lower = trimmed.to_lowercase();
-
-    if lower.starts_with("!ban") {
-        let args = trimmed[5..].trim();
-        let (target, rest) = match args.split_once(char::is_whitespace) {
-            Some((t, r)) => (t, r),
-            None => (args, ""),
-        };
-        let target = target.trim_start_matches('@').to_string();
-        if target.is_empty() {
-            return None;
-        }
-        return Some((
-            "mod_ban".to_string(),
-            serde_json::json!({
-                "platform": "youtube",
-                "handle": target,
-                "reason": rest.trim().to_string(),
-                "actor": { "platform": "youtube", "handle": author },
-            }),
-        ));
-    }
-
-    if lower.starts_with("!timeout") {
-        let args = trimmed[9..].trim();
-        let mut parts = args.split_whitespace();
-        let target = parts.next().unwrap_or("").trim_start_matches('@').to_string();
-        if target.is_empty() {
-            return None;
-        }
-        let mut duration_secs = 300i64;
-        let mut reason = String::new();
-        if let Some(d) = parts.next() {
-            if let Ok(secs) = d.parse::<i64>() {
-                duration_secs = secs;
-            } else {
-                reason = d.to_string();
+/// Build a moderator query from the engine-routed command. The engine already
+/// parsed + routed `!ban`/`!timeout`; here we map command_name -> query and
+/// extract the target/reason from the message args (no re-parsing).
+fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(String, serde_json::Value)> {
+    let mut tokens = message.trim().split_whitespace();
+    let _cmd = tokens.next()?;
+    match command_name {
+        "ban" => {
+            let target = tokens.next()?.trim_start_matches('@').to_string();
+            if target.is_empty() {
+                return None;
             }
+            return Some((
+                "mod_ban".to_string(),
+                serde_json::json!({
+                    "platform": "youtube",
+                    "handle": target,
+                    "reason": tokens.collect::<Vec<_>>().join(" "),
+                    "actor": { "platform": "youtube", "handle": author },
+                }),
+            ));
         }
-        let rest: Vec<&str> = parts.collect();
-        if !rest.is_empty() {
-            if !reason.is_empty() {
-                reason = format!("{} {}", reason, rest.join(" "));
-            } else {
-                reason = rest.join(" ");
-            }
-        }
-        return Some((
-            "mod_timeout".to_string(),
-            serde_json::json!({
-                "platform": "youtube",
-                "handle": target,
-                "duration_secs": duration_secs,
-                "reason": reason,
-                "actor": { "platform": "youtube", "handle": author },
-            }),
-        ));
-    }
 
-    None
+        "timeout" => {
+            let target = tokens.next()?.trim_start_matches('@').to_string();
+            if target.is_empty() {
+                return None;
+            }
+            let mut duration_secs = 300i64;
+            let mut reason = String::new();
+            if let Some(d) = tokens.next() {
+                if let Ok(secs) = d.parse::<i64>() {
+                    duration_secs = secs;
+                } else {
+                    reason = d.to_string();
+                }
+            }
+            let rest: Vec<&str> = tokens.collect();
+            if !rest.is_empty() {
+                if !reason.is_empty() {
+                    reason = format!("{} {}", reason, rest.join(" "));
+                } else {
+                    reason = rest.join(" ");
+                }
+            }
+            return Some((
+                "mod_timeout".to_string(),
+                serde_json::json!({
+                    "platform": "youtube",
+                    "handle": target,
+                    "duration_secs": duration_secs,
+                    "reason": reason,
+                    "actor": { "platform": "youtube", "handle": author },
+                }),
+            ));
+        }
+
+        _ => None,
+    }
 }
 
 fn load_adapter_config() -> Option<YoutubeAdapterConfig> {
@@ -1943,7 +1939,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .as_ref()
                                 .map(|u| u.username.clone())
                                 .unwrap_or_default();
-                            if let Some((qid, payload)) = parse_mod_command(&chat.raw_message, &author) {
+                            if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
                                 let query = Container {
                                     version: 1,
                                     auth_token: auth_task.clone(),
@@ -2293,6 +2289,22 @@ match tonic::transport::Channel::from_static("https://youtube.googleapis.com")
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_routed_command_maps_to_mod_query() {
+        let (qid, p) = build_mod_query("ban", "!ban @user being awful", "mod").unwrap();
+        assert_eq!(qid, "mod_ban");
+        assert_eq!(p["handle"], "user");
+        assert_eq!(p["reason"], "being awful");
+        assert_eq!(p["actor"]["handle"], "mod");
+
+        let (qid, p) = build_mod_query("timeout", "!timeout @user 300 spam", "mod").unwrap();
+        assert_eq!(qid, "mod_timeout");
+        assert_eq!(p["duration_secs"], 300);
+        assert_eq!(p["reason"], "spam");
+
+        assert!(build_mod_query("!help", "!help", "mod").is_none());
+    }
 
     #[test]
     fn test_extract_video_id() {
