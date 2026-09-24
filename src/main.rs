@@ -23,6 +23,60 @@ type WsWriteHalf = futures_util::stream::SplitSink<
     WsMessage,
 >;
 
+/// The module's engine-session identity (auth token + assigned instance + name).
+/// Held in a shared Mutex so a reconnect can swap it in place and every other
+/// task (read loop, platform send path) always uses the CURRENT session's
+/// credentials — a stale token after a reconnect would be rejected by the
+/// engine and the module would look dead.
+#[derive(Clone, Default)]
+struct EngineIdentity {
+    auth: String,
+    instance: String,
+    module: String,
+}
+
+/// Re-register the adapter's chat commands with the engine (called on the
+/// initial connect AND after every reconnect — the engine forgets a session's
+/// commands when the socket drops).
+async fn register_commands(
+    write: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let commands = Container {
+        version: 1,
+        auth_token: auth.clone(),
+        module_name: module.clone(),
+        module_instance_uuid7: instance.clone(),
+        payload: Some(Payload::CommandsPayload(Commands {
+            commands: vec![
+                Command {
+                    command_name: "ban".to_string(),
+                    command_flag: "!".to_string(),
+                    command_description: "ban a user".to_string(),
+                    command_flags: vec![],
+                },
+                Command {
+                    command_name: "timeout".to_string(),
+                    command_flag: "!".to_string(),
+                    command_description: "timeout a user".to_string(),
+                    command_flags: vec![],
+                },
+            ],
+            alert_on_unknown_command: false,
+        })),
+    };
+    let mut cbuf = Vec::new();
+    if commands.encode(&mut cbuf).is_ok() {
+        let mut w = write.lock().await;
+        let _ = w.send(WsMessage::Binary(cbuf.into())).await;
+    }
+    info!("registered !ban / !timeout commands");
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct YoutubeAdapterConfig {
     channel_id: Option<String>,
@@ -336,7 +390,7 @@ fn tie_choices_help() -> String {
 /// (i)gnore / (r)emove / (e)dit. Reprompts until a valid choice (or None on
 /// cancel).
 async fn prompt_tie_choice(
-    write_ws: &mut WsWriteHalf,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
@@ -536,6 +590,7 @@ impl OAuthManager {
                 ("client_secret", self.client_secret.as_str()),
                 ("refresh_token", refresh.as_str()),
             ])
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .map_err(|e| format!("token refresh failed: {}", e))?
@@ -1312,8 +1367,13 @@ async fn fetch_streams(
 
 /// Send a Prompt to the engine (forwarded to connected UIs) and wait for the
 /// operator's response (`PromptResponse.reason`). Returns None on cancel/timeout.
+///
+/// The write lock is taken ONLY to send the prompt and released before waiting
+/// for the answer — holding it across the wait would block the read loop's
+/// AuthVerify reply and make the module look unresponsive to the engine's
+/// liveness probe (which severs it).
 async fn prompt_for_input(
-    write_ws: &mut WsWriteHalf,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
@@ -1355,8 +1415,11 @@ async fn prompt_for_input(
     if container.encode(&mut buf).is_err() {
         return None;
     }
-    if write_ws.send(WsMessage::Binary(buf.into())).await.is_err() {
-        return None;
+    {
+        let mut w = write_ws.lock().await;
+        if w.send(WsMessage::Binary(buf.into())).await.is_err() {
+            return None;
+        }
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64 + 10);
@@ -1388,7 +1451,7 @@ async fn select_stream(
     keys: &ApiKeyManager,
     unlisted_ids: &mut Vec<String>,
     channel_id: &str,
-    write_ws: &mut WsWriteHalf,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
@@ -1584,6 +1647,7 @@ async fn send_to_youtube(
         .post("https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet")
         .bearer_auth(&access)
         .json(&body)
+        .timeout(Duration::from_secs(15))
         .send()
         .await
         .map_err(|e| format!("send request failed: {}", e))?;
@@ -1599,10 +1663,8 @@ async fn send_to_youtube(
 
 #[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
-    write_ws: &mut WsWriteHalf,
-    auth_token: &str,
-    module_name: &str,
-    instance_uuid: &str,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
     client: &reqwest::Client,
     video_id: &str,
     keys: &ApiKeyManager,
@@ -1794,16 +1856,21 @@ async fn monitor_stream_chat(
                                         user_data: None,
                                     }),
                                 };
+                                let (auth, module, instance) = {
+                                    let id = identity.lock().await;
+                                    (id.auth.clone(), id.module.clone(), id.instance.clone())
+                                };
                                 let container = Container {
                                     version: 1,
-                                    auth_token: auth_token.to_string(),
-                                    module_name: module_name.to_string(),
-                                    module_instance_uuid7: instance_uuid.to_string(),
+                                    auth_token: auth,
+                                    module_name: module,
+                                    module_instance_uuid7: instance,
                                     payload: Some(Payload::MessagePreProcess(pre_process)),
                                 };
                                 let mut buf = Vec::new();
                                 if container.encode(&mut buf).is_ok() {
-                                    if let Err(e) = write_ws.send(WsMessage::Binary(buf.into())).await {
+                                    let mut w = write_ws.lock().await;
+                                    if let Err(e) = w.send(WsMessage::Binary(buf.into())).await {
                                         error!("Failed to send to engine: {}", e);
                                     }
                                 }
@@ -1843,47 +1910,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cockatiel = CockatielClient::connect("config.json").await?;
 
-    let auth_token = cockatiel.auth_token.clone();
-    let instance_uuid = cockatiel.instance_uuid7.clone();
-    let module_name = cockatiel.config.module_name.clone();
-    let (write_ws_cockatiel, mut read_ws_cockatiel) = cockatiel.stream.split();
+    let (write_ws_cockatiel, read_ws_cockatiel) = cockatiel.stream.split();
     let write_ws_cockatiel = Arc::new(tokio::sync::Mutex::new(write_ws_cockatiel));
+    // Shared session identity: the read loop AND the platform send path read
+    // the CURRENT token/instance here, so a reconnect (which swaps this) never
+    // leaves stale credentials behind.
+    let identity: Arc<tokio::sync::Mutex<EngineIdentity>> = Arc::new(tokio::sync::Mutex::new(
+        EngineIdentity {
+            auth: cockatiel.auth_token.clone(),
+            instance: cockatiel.instance_uuid7.clone(),
+            module: cockatiel.config.module_name.clone(),
+        },
+    ));
 
     // Register the mod commands with the engine command system: the engine now
     // parses `!ban` / `!timeout` and routes them back with the parsed Command.
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let commands = Container {
-            version: 1,
-            auth_token: auth_token.clone(),
-            module_name: module_name.clone(),
-            module_instance_uuid7: instance_uuid.clone(),
-            payload: Some(Payload::CommandsPayload(Commands {
-                commands: vec![
-                    Command {
-                        command_name: "ban".to_string(),
-                        command_flag: "!".to_string(),
-                        command_description: "ban a user".to_string(),
-                        command_flags: vec![],
-                    },
-                    Command {
-                        command_name: "timeout".to_string(),
-                        command_flag: "!".to_string(),
-                        command_description: "timeout a user".to_string(),
-                        command_flags: vec![],
-                    },
-                ],
-                alert_on_unknown_command: false,
-            })),
-        };
-        let mut cbuf = Vec::new();
-        use prost::Message;
-        if commands.encode(&mut cbuf).is_ok() {
-            let mut w = write_ws_cockatiel.lock().await;
-            let _ = w.send(WsMessage::Binary(cbuf.into())).await;
-        }
-        info!("registered !ban / !timeout commands");
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    register_commands(&write_ws_cockatiel, &identity).await;
+
+    // Initial identity, used by the (one-time) setup phase prompts. Runtime
+    // sends read the CURRENT identity from the shared handle instead.
+    let (auth_token, instance_uuid, module_name) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.instance.clone(), id.module.clone())
+    };
 
     // HTTP client (HTTP/1.1: reqwest's default HTTP/2 negotiation against
     // googleapis is flaky and produced "connection closed before message
@@ -1944,14 +1994,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
     let prompt_tx_task = prompt_tx.clone();
     let write_task = write_ws_cockatiel.clone();
-    let auth_task = auth_token.clone();
-    let module_task = module_name.clone();
-    let instance_task = instance_uuid.clone();
+    let identity_task = identity.clone();
     tokio::spawn(async move {
-        while let Some(msg) = read_ws_cockatiel.next().await {
+        // Read-loop + engine-session supervisor. When the socket drops the
+        // module RECONNECTS instead of going zombie on a dead socket (the old
+        // behavior: the platform loop kept pushing into a dead WS forever).
+        let mut read = read_ws_cockatiel;
+        loop {
+            // Read until the connection dies.
+            while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
                     if let Ok(container) = Container::decode(data.as_ref()) {
+                        // Use the CURRENT session identity (a reconnect swaps it).
+                        let (auth, instance, module) = {
+                            let id = identity_task.lock().await;
+                            (id.auth.clone(), id.instance.clone(), id.module.clone())
+                        };
                         info!(
                             "Received from engine: {:?}",
                             container
@@ -1965,11 +2024,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(Payload::AuthVerify(_)) = container.payload {
                             let reply = Container {
                                 version: 1,
-                                auth_token: auth_task.clone(),
-                                module_name: module_task.clone(),
-                                module_instance_uuid7: instance_task.clone(),
+                                auth_token: auth.clone(),
+                                module_name: module.clone(),
+                                module_instance_uuid7: instance.clone(),
                                 payload: Some(Payload::AuthVerify(AuthVerify {
-                                    cur_auth: auth_task.clone(),
+                                    cur_auth: auth.clone(),
                                 })),
                             };
                             let mut buf = Vec::new();
@@ -2004,9 +2063,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
                                 let query = Container {
                                     version: 1,
-                                    auth_token: auth_task.clone(),
-                                    module_name: module_task.clone(),
-                                    module_instance_uuid7: instance_task.clone(),
+                                    auth_token: auth.clone(),
+                                    module_name: module.clone(),
+                                    module_instance_uuid7: instance.clone(),
                                     payload: Some(Payload::DatabaseQuery(DatabaseQuery {
                                         query_id: qid,
                                         sql: payload.to_string(),
@@ -2031,6 +2090,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 _ => {}
+            }
+            }
+
+            // The engine connection dropped — reconnect with backoff instead of
+            // leaving the platform loop pushing into a dead socket.
+            info!("Engine disconnected — reconnecting...");
+            let mut backoff = 1u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                match CockatielClient::connect("config.json").await {
+                    Ok(conn) => {
+                        info!("Reconnected to engine");
+                        let (w, r) = conn.stream.split();
+                        *write_task.lock().await = w;
+                        *identity_task.lock().await = EngineIdentity {
+                            auth: conn.auth_token,
+                            instance: conn.instance_uuid7,
+                            module: conn.config.module_name,
+                        };
+                        // The engine forgets a session's commands when the
+                        // socket drops — re-register on the fresh session.
+                        register_commands(&write_task, &identity_task).await;
+                        read = r;
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
+                        backoff = (backoff * 2).min(30);
+                    }
+                }
             }
         }
     });
@@ -2088,7 +2177,7 @@ if channel_input.is_empty() || api_keys.is_empty() {
                 }
             } else if !saved_keys.is_empty() {
                 let confirm = prompt_for_input(
-                    &mut *write_ws_cockatiel.lock().await,
+                    &write_ws_cockatiel,
                     &mut prompt_rx,
                     &auth_token,
                     &module_name,
@@ -2125,7 +2214,7 @@ if channel_input.is_empty() || api_keys.is_empty() {
 
 if channel_input.is_empty() {
     let input = prompt_for_input(
-        &mut *write_ws_cockatiel.lock().await,
+        &write_ws_cockatiel,
         &mut prompt_rx,
         &auth_token,
         &module_name,
@@ -2145,7 +2234,7 @@ if channel_input.is_empty() {
 
 if api_keys.is_empty() {
     let input = prompt_for_input(
-        &mut *write_ws_cockatiel.lock().await,
+        &write_ws_cockatiel,
         &mut prompt_rx,
         &auth_token,
         &module_name,
@@ -2187,7 +2276,7 @@ info!(
 if !is_api_key_valid(&client, &key_manager).await {
     warn!("YouTube API key is invalid or missing. Prompting user for a valid key...");
     let new_key = prompt_for_input(
-        &mut *write_ws_cockatiel.lock().await,
+        &write_ws_cockatiel,
         &mut prompt_rx,
         &auth_token,
         &module_name,
@@ -2295,7 +2384,7 @@ let channel_id: String = loop {
         }
         TargetOutcome::Invalid(subject) => {
             let choice = prompt_tie_choice(
-                &mut *write_ws_cockatiel.lock().await,
+                &write_ws_cockatiel,
                 &mut prompt_rx,
                 &auth_token,
                 &module_name,
@@ -2318,7 +2407,7 @@ let channel_id: String = loop {
                 Some(TieChoice::Remove) => {
                     setup_log.push_str(&format!("target '{}' invalid — removed\n", channel_input));
                     let fresh = prompt_for_input(
-                        &mut *write_ws_cockatiel.lock().await,
+                        &write_ws_cockatiel,
                         &mut prompt_rx,
                         &auth_token,
                         &module_name,
@@ -2342,7 +2431,7 @@ let channel_id: String = loop {
                 }
                 Some(TieChoice::Edit) => {
                     let corrected = prompt_for_input(
-                        &mut *write_ws_cockatiel.lock().await,
+                        &write_ws_cockatiel,
                         &mut prompt_rx,
                         &auth_token,
                         &module_name,
@@ -2450,7 +2539,7 @@ loop {
         &key_manager,
         &mut unlisted_ids,
         &channel_id,
-        &mut *write_ws_cockatiel.lock().await,
+        &write_ws_cockatiel,
         &mut prompt_rx,
         &auth_token,
         &module_name,
@@ -2473,10 +2562,8 @@ loop {
 
     // Monitor stream live chat until the stream ends
     monitor_stream_chat(
-        &mut *write_ws_cockatiel.lock().await,
-        &auth_token,
-        &module_name,
-        &instance_uuid,
+        &write_ws_cockatiel,
+        &identity,
         &client,
         &chosen_stream.video_id,
         &key_manager,
