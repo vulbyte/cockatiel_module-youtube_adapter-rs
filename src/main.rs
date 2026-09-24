@@ -305,6 +305,68 @@ fn save_adapter_config(
     }
 }
 
+/// The operator's choice when a configured channel/video target is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TieChoice {
+    /// Re-test the same target (the failure may be transient).
+    Retry,
+    /// Keep the target but skip it for now (noted in the log).
+    Ignore,
+    /// Remove the target from the config.
+    Remove,
+    /// Prompt for a replacement target and re-test.
+    Edit,
+}
+
+fn parse_tie_choice(answer: &str) -> Option<TieChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "t" | "try" | "retry" | "try again" => Some(TieChoice::Retry),
+        "i" | "ignore" => Some(TieChoice::Ignore),
+        "r" | "remove" => Some(TieChoice::Remove),
+        "e" | "edit" => Some(TieChoice::Edit),
+        _ => None,
+    }
+}
+
+fn tie_choices_help() -> String {
+    "Enter one of: (t)ry again, (i)gnore, (r)emove, (e)dit".to_string()
+}
+
+/// Ask the operator how to handle an invalid channel/video target: (t)ry /
+/// (i)gnore / (r)emove / (e)dit. Reprompts until a valid choice (or None on
+/// cancel).
+async fn prompt_tie_choice(
+    write_ws: &mut WsWriteHalf,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    subject: &str,
+) -> Option<TieChoice> {
+    loop {
+        let answer = prompt_for_input(
+            write_ws,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "Invalid YouTube Entry",
+            &format!("{}\n\n{}", subject, tie_choices_help()),
+            "t / i / r / e",
+            PromptKind::String,
+            300,
+        )
+        .await;
+        match answer.as_deref().and_then(parse_tie_choice) {
+            Some(c) => return Some(c),
+            None if answer.is_some() => {
+                warn!("Unrecognized choice — expected t / i / r / e.");
+            }
+            None => return None, // cancelled
+        }
+    }
+}
+
 // ── OAuth2 token management (for sending to live chat) ────────────────
 
 /// Persist only the OAuth refresh token (a secret → `.env`), leaving
@@ -1973,322 +2035,478 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Re-acquire credentials whenever YouTube rejects them (bad channel/API key).
+    // ── Linear setup phase ───────────────────────────────────────────────
+    // Resolve auth + API keys, validate the target (channel/video) with an
+    // explicit operator choice on failure, then surface a setup summary.
     cockatiel_client::load_env_file(".env");
-    'configure: loop {
-        let mut channel_input = std::env::var("YOUTUBE_CHANNEL_ID").unwrap_or_default();
-        let mut api_keys: Vec<String> = Vec::new();
-        let mut unlisted_ids: Vec<String> = Vec::new();
+    let mut setup_log = String::new();
+    let mut channel_input = std::env::var("YOUTUBE_CHANNEL_ID").unwrap_or_default();
+    let mut api_keys: Vec<String> = Vec::new();
+    let mut unlisted_ids: Vec<String> = Vec::new();
 
-        if let Ok(env_key) = std::env::var("YOUTUBE_API_KEY") {
-            // load_env_file joins list values with "\n"; accept either a single
-            // key or several.
-            for part in env_key.split('\n') {
-                let trimmed = part.trim().to_string();
-                if !trimmed.is_empty() {
-                    api_keys.push(trimmed);
-                }
+    if let Ok(env_key) = std::env::var("YOUTUBE_API_KEY") {
+        // load_env_file joins list values with "\n"; accept either a single
+        // key or several.
+        for part in env_key.split('\n') {
+            let trimmed = part.trim().to_string();
+            if !trimmed.is_empty() {
+                api_keys.push(trimmed);
             }
         }
+    }
 
-    if channel_input.is_empty() || api_keys.is_empty() {
-        // Non-interactive fast path: if a complete saved config exists, use it
-        // without prompting (enables the TUI to supply credentials via file).
-        if let Some(saved) = load_adapter_config() {
-            if let Some(saved_chan) = saved.channel_id {
-                let mut saved_keys = Vec::new();
-                if let Some(k_list) = saved.api_keys {
-                    for k in k_list {
-                        let trimmed = k.trim().to_string();
-                        if !trimmed.is_empty() && !saved_keys.contains(&trimmed) {
-                            saved_keys.push(trimmed);
-                        }
-                    }
-                }
-                if let Some(single) = saved.api_key {
-                    let trimmed = single.trim().to_string();
+if channel_input.is_empty() || api_keys.is_empty() {
+    // Non-interactive fast path: if a complete saved config exists, use it
+    // without prompting (enables the TUI to supply credentials via file).
+    if let Some(saved) = load_adapter_config() {
+        if let Some(saved_chan) = saved.channel_id {
+            let mut saved_keys = Vec::new();
+            if let Some(k_list) = saved.api_keys {
+                for k in k_list {
+                    let trimmed = k.trim().to_string();
                     if !trimmed.is_empty() && !saved_keys.contains(&trimmed) {
                         saved_keys.push(trimmed);
                     }
                 }
+            }
+            if let Some(single) = saved.api_key {
+                let trimmed = single.trim().to_string();
+                if !trimmed.is_empty() && !saved_keys.contains(&trimmed) {
+                    saved_keys.push(trimmed);
+                }
+            }
 
-                if !saved_chan.is_empty() && !saved_keys.is_empty() && channel_input.is_empty() && api_keys.is_empty() {
-                    info!(
-                        "Using complete saved YouTube configuration for channel '{}' (no prompt).",
-                        saved_chan
-                    );
-                    channel_input = saved_chan;
-                    api_keys = saved_keys;
-                    if let Some(saved_unlisted) = saved.unlisted_video_ids {
-                        unlisted_ids = saved_unlisted;
+            if !saved_chan.is_empty() && !saved_keys.is_empty() && channel_input.is_empty() && api_keys.is_empty() {
+                info!(
+                    "Using complete saved YouTube configuration for channel '{}' (no prompt).",
+                    saved_chan
+                );
+                channel_input = saved_chan;
+                api_keys = saved_keys;
+                if let Some(saved_unlisted) = saved.unlisted_video_ids {
+                    unlisted_ids = saved_unlisted;
+                }
+            } else if !saved_keys.is_empty() {
+                let confirm = prompt_for_input(
+                    &mut *write_ws_cockatiel.lock().await,
+                    &mut prompt_rx,
+                    &auth_token,
+                    &module_name,
+                    &instance_uuid,
+                    "Use Saved YouTube Configuration?",
+                    &format!(
+                        "A saved configuration was found:\n\n\
+                         Channel: {}\n\
+                         API key(s): {}\n\n\
+                         Use this configuration?",
+                        saved_chan,
+                        saved_keys.len()
+                    ),
+                    // Empty input_label + boolean kind → true y/n prompt (y accepts, n/Esc
+                    // cancels). The caller treats Some(..) as "yes".
+                    "",
+                    PromptKind::Boolean,
+                    120,
+                )
+                .await;
+                if let Some(choice) = confirm {
+                    if choice.trim().eq_ignore_ascii_case("y") || choice.trim().eq_ignore_ascii_case("yes") {
+                        channel_input = saved_chan;
+                        api_keys = saved_keys;
+                        if let Some(saved_unlisted) = saved.unlisted_video_ids {
+                            unlisted_ids = saved_unlisted;
+                        }
                     }
-                } else if !saved_keys.is_empty() {
-                    let confirm = prompt_for_input(
+                }
+            }
+        }
+    }
+}
+
+if channel_input.is_empty() {
+    let input = prompt_for_input(
+        &mut *write_ws_cockatiel.lock().await,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+        "YouTube Channel Configuration",
+        "Enter your YouTube Channel Handle (e.g. @vulbyte), Channel ID (UC...),\n\
+         or a direct Video ID / Stream URL (for unlisted streams).",
+        "Channel Handle, ID, or Video URL",
+        PromptKind::String,
+        300,
+    )
+    .await;
+    if let Some(val) = input {
+        channel_input = val.trim().to_string();
+    }
+}
+
+if api_keys.is_empty() {
+    let input = prompt_for_input(
+        &mut *write_ws_cockatiel.lock().await,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+        "YouTube API Key Required",
+        "Enter a YouTube Data API Key for stream discovery and chat monitoring.\n\n\
+         To get a key:\n\
+         1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
+         2. Create an API key\n\
+         3. Enable the YouTube Data API v3\n\n\
+         You can add additional keys later for quota rotation by editing\n\
+         config.json. Press Cancel to skip (discovery will still work\n\
+         via InnerTube, but chat monitoring won't).",
+        "YouTube Data API Key",
+        PromptKind::Credential,
+        300,
+    )
+    .await;
+    if let Some(key) = input {
+        let trimmed = key.trim().to_string();
+        if !trimmed.is_empty() {
+            api_keys.push(trimmed);
+            save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
+        }
+    }
+    println!();
+}
+
+let mut key_manager = ApiKeyManager::new(api_keys.clone());
+info!(
+    "Initialized YouTube API Key Manager with {} key(s) for automatic rotation",
+    key_manager.key_count()
+);
+
+// ── Validate the API key early ──────────────────────────────────────
+// If the key is invalid (e.g. the placeholder "testkey"), prompt the
+// user to enter a real key via the TUI prompt dialog so they never have
+// to manually edit a config file.
+if !is_api_key_valid(&client, &key_manager).await {
+    warn!("YouTube API key is invalid or missing. Prompting user for a valid key...");
+    let new_key = prompt_for_input(
+        &mut *write_ws_cockatiel.lock().await,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+        "YouTube API Key Required",
+        "Your YouTube Data API key is invalid or missing.\n\n\
+         Stream discovery will still work without a key (via InnerTube),\n\
+         but live chat monitoring requires a valid key.\n\n\
+         To get a key:\n\
+         1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
+         2. Create an API key\n\
+         3. Enable the YouTube Data API v3\n\n\
+         Enter your API key below, or press Cancel to continue\n\
+         without chat monitoring (discovery only).",
+        "YouTube Data API Key",
+        PromptKind::Credential,
+        300,
+    )
+    .await;
+
+    if let Some(key) = new_key {
+        let trimmed = key.trim().to_string();
+        if !trimmed.is_empty() {
+            api_keys = vec![trimmed];
+            key_manager = ApiKeyManager::new(api_keys.clone());
+            save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
+            info!("YouTube API key updated and saved to config.json");
+            // Re-validate immediately so we catch typos before entering the
+            // discovery loop.
+            if !is_api_key_valid(&client, &key_manager).await {
+                warn!(
+                    "The key you entered still fails validation. \
+                     You can re-enter it by restarting the module."
+                );
+            }
+        }
+    } else {
+        info!("No API key provided — continuing with discovery-only mode (InnerTube).");
+    }
+}
+
+// ── Target (channel/video) validation with an explicit operator choice ──
+// The old code cleared creds + `continue 'configure` on a resolution
+// failure, which could re-prompt forever. Instead, resolve/validate the
+// target once and — when it can't be resolved — ask the operator to
+// (t)ry, (i)gnore, (r)emove, or (e)dit it. Every path then breaks into the
+// receive-only discovery loop (never an automatic re-prompt spin).
+enum TargetOutcome {
+    Valid(String),
+    Invalid(String),
+    CannotVerify,
+}
+
+let channel_id: String = loop {
+    let maybe_video_id = extract_video_id(&channel_input);
+
+    let outcome = if let Some(ref vid) = maybe_video_id {
+        info!("Targeting direct video stream ID: {}", vid);
+        match fetch_video_stream(&client, vid, &key_manager).await {
+            Ok(Some(_)) => {
+                if !unlisted_ids.contains(vid) {
+                    unlisted_ids.push(vid.clone());
+                }
+                TargetOutcome::Valid("".to_string())
+            }
+            Ok(None) => TargetOutcome::Invalid(format!(
+                "target '{}' could not be resolved as a YouTube channel or live stream.",
+                channel_input
+            )),
+            Err(e) => {
+                warn!("Could not verify target '{}': {}.", channel_input, e);
+                if !unlisted_ids.contains(vid) {
+                    unlisted_ids.push(vid.clone());
+                }
+                TargetOutcome::CannotVerify
+            }
+        }
+    } else {
+        match get_channel_id(&client, &channel_input, &key_manager).await {
+            Ok(cid) => TargetOutcome::Valid(cid),
+            Err(e) => {
+                error!("Failed to resolve YouTube channel '{}': {}.", channel_input, e);
+                TargetOutcome::Invalid(format!(
+                    "target '{}' could not be resolved as a YouTube channel or live stream.",
+                    channel_input
+                ))
+            }
+        }
+    };
+
+    match outcome {
+        TargetOutcome::Valid(cid) => {
+            if cid != channel_input && cid.starts_with("UC") {
+                save_adapter_config(&cid, &api_keys, &unlisted_ids, "", "", "");
+            }
+            setup_log.push_str(&format!("target '{}' is valid\n", channel_input));
+            break cid;
+        }
+        TargetOutcome::CannotVerify => {
+            setup_log.push_str(&format!(
+                "target '{}' could not be verified — will retry at runtime\n",
+                channel_input
+            ));
+            break String::new();
+        }
+        TargetOutcome::Invalid(subject) => {
+            let choice = prompt_tie_choice(
+                &mut *write_ws_cockatiel.lock().await,
+                &mut prompt_rx,
+                &auth_token,
+                &module_name,
+                &instance_uuid,
+                &subject,
+            )
+            .await;
+            match choice {
+                Some(TieChoice::Retry) => {
+                    // Re-validate the same target.
+                    continue;
+                }
+                Some(TieChoice::Ignore) => {
+                    setup_log.push_str(&format!(
+                        "target '{}' invalid — ignored (will retry at runtime)\n",
+                        channel_input
+                    ));
+                    break String::new();
+                }
+                Some(TieChoice::Remove) => {
+                    setup_log.push_str(&format!("target '{}' invalid — removed\n", channel_input));
+                    let fresh = prompt_for_input(
                         &mut *write_ws_cockatiel.lock().await,
                         &mut prompt_rx,
                         &auth_token,
                         &module_name,
                         &instance_uuid,
-                        "Use Saved YouTube Configuration?",
-                        &format!(
-                            "A saved configuration was found:\n\n\
-                             Channel: {}\n\
-                             API key(s): {}\n\n\
-                             Use this configuration?",
-                            saved_chan,
-                            saved_keys.len()
-                        ),
-                        // Empty input_label + boolean kind → true y/n prompt (y accepts, n/Esc
-                        // cancels). The caller treats Some(..) as "yes".
-                        "",
-                        PromptKind::Boolean,
-                        120,
+                        "YouTube Channel Configuration",
+                        "Enter your YouTube Channel Handle (e.g. @vulbyte), Channel ID (UC...),\n\
+                         or a direct Video ID / Stream URL (for unlisted streams).",
+                        "Channel Handle, ID, or Video URL",
+                        PromptKind::String,
+                        300,
                     )
                     .await;
-                    if let Some(choice) = confirm {
-                        if choice.trim().eq_ignore_ascii_case("y") || choice.trim().eq_ignore_ascii_case("yes") {
-                            channel_input = saved_chan;
-                            api_keys = saved_keys;
-                            if let Some(saved_unlisted) = saved.unlisted_video_ids {
-                                unlisted_ids = saved_unlisted;
-                            }
+                    if let Some(val) = fresh {
+                        let t = val.trim().to_string();
+                        if !t.is_empty() {
+                            channel_input = t;
+                            continue;
                         }
                     }
+                    break String::new();
+                }
+                Some(TieChoice::Edit) => {
+                    let corrected = prompt_for_input(
+                        &mut *write_ws_cockatiel.lock().await,
+                        &mut prompt_rx,
+                        &auth_token,
+                        &module_name,
+                        &instance_uuid,
+                        "Edit YouTube Target",
+                        "Enter the corrected YouTube channel handle, Channel ID, or Video ID / URL.",
+                        "Channel Handle, ID, or Video URL",
+                        PromptKind::String,
+                        300,
+                    )
+                    .await;
+                    if let Some(val) = corrected {
+                        let t = val.trim().to_string();
+                        if !t.is_empty() {
+                            channel_input = t;
+                            continue;
+                        }
+                    }
+                    break String::new();
+                }
+                None => {
+                    setup_log.push_str(&format!(
+                        "target '{}' invalid — skipped (cancelled)\n",
+                        channel_input
+                    ));
+                    break String::new();
                 }
             }
         }
     }
+};
 
-    if channel_input.is_empty() {
-        let input = prompt_for_input(
-            &mut *write_ws_cockatiel.lock().await,
-            &mut prompt_rx,
-            &auth_token,
-            &module_name,
-            &instance_uuid,
-            "YouTube Channel Configuration",
-            "Enter your YouTube Channel Handle (e.g. @vulbyte), Channel ID (UC...),\n\
-             or a direct Video ID / Stream URL (for unlisted streams).",
-            "Channel Handle, ID, or Video URL",
-            PromptKind::String,
-            300,
-        )
-        .await;
-        if let Some(val) = input {
-            channel_input = val.trim().to_string();
-        }
-    }
-
-    if api_keys.is_empty() {
-        let input = prompt_for_input(
-            &mut *write_ws_cockatiel.lock().await,
-            &mut prompt_rx,
-            &auth_token,
-            &module_name,
-            &instance_uuid,
-            "YouTube API Key Required",
-            "Enter a YouTube Data API Key for stream discovery and chat monitoring.\n\n\
-             To get a key:\n\
-             1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
-             2. Create an API key\n\
-             3. Enable the YouTube Data API v3\n\n\
-             You can add additional keys later for quota rotation by editing\n\
-             config.json. Press Cancel to skip (discovery will still work\n\
-             via InnerTube, but chat monitoring won't).",
-            "YouTube Data API Key",
-            PromptKind::Credential,
-            300,
-        )
-        .await;
-        if let Some(key) = input {
-            let trimmed = key.trim().to_string();
-            if !trimmed.is_empty() {
-                api_keys.push(trimmed);
-                save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
-            }
-        }
-        println!();
-    }
-
-    let mut key_manager = ApiKeyManager::new(api_keys.clone());
-    info!(
-        "Initialized YouTube API Key Manager with {} key(s) for automatic rotation",
-        key_manager.key_count()
-    );
-
-    // ── Validate the API key early ──────────────────────────────────────
-    // If the key is invalid (e.g. the placeholder "testkey"), prompt the
-    // user to enter a real key via the TUI prompt dialog so they never have
-    // to manually edit a config file.
-    if !is_api_key_valid(&client, &key_manager).await {
-        warn!("YouTube API key is invalid or missing. Prompting user for a valid key...");
-        let new_key = prompt_for_input(
-            &mut *write_ws_cockatiel.lock().await,
-            &mut prompt_rx,
-            &auth_token,
-            &module_name,
-            &instance_uuid,
-            "YouTube API Key Required",
-            "Your YouTube Data API key is invalid or missing.\n\n\
-             Stream discovery will still work without a key (via InnerTube),\n\
-             but live chat monitoring requires a valid key.\n\n\
-             To get a key:\n\
-             1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
-             2. Create an API key\n\
-             3. Enable the YouTube Data API v3\n\n\
-             Enter your API key below, or press Cancel to continue\n\
-             without chat monitoring (discovery only).",
-            "YouTube Data API Key",
-            PromptKind::Credential,
-            300,
-        )
-        .await;
-
-        if let Some(key) = new_key {
-            let trimmed = key.trim().to_string();
-            if !trimmed.is_empty() {
-                api_keys = vec![trimmed];
-                key_manager = ApiKeyManager::new(api_keys.clone());
-                save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
-                info!("YouTube API key updated and saved to config.json");
-                // Re-validate immediately so we catch typos before entering the
-                // discovery loop.
-                if !is_api_key_valid(&client, &key_manager).await {
-                    warn!(
-                        "The key you entered still fails validation. \
-                         You can re-enter it by restarting the module."
-                    );
-                }
-            }
-        } else {
-            info!("No API key provided — continuing with discovery-only mode (InnerTube).");
-        }
-    }
-
-    let maybe_video_id = extract_video_id(&channel_input);
-
-    let channel_id = if let Some(ref vid) = maybe_video_id {
-        info!("Targeting direct video stream ID: {}", vid);
-        if !unlisted_ids.contains(vid) {
-            unlisted_ids.push(vid.clone());
-        }
-        "".to_string()
-    } else {
-        match get_channel_id(&client, &channel_input, &key_manager).await {
-            Ok(cid) => {
-                if cid != channel_input && cid.starts_with("UC") {
-                    save_adapter_config(&cid, &api_keys, &unlisted_ids, "", "", "");
-                }
-                cid
-            }
-            Err(e) => {
-                error!("Failed to resolve YouTube channel '{}': {}. Re-acquiring credentials...", channel_input, e);
-                channel_input.clear();
-                api_keys.clear();
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                continue 'configure;
-            }
-        }
+// Surface the setup summary to the operator (the accumulated log).
+if !setup_log.trim().is_empty() {
+    let log = Container {
+        version: 1,
+        auth_token: auth_token.clone(),
+        module_name: module_name.clone(),
+        module_instance_uuid7: instance_uuid.clone(),
+        payload: Some(Payload::Log(cockatiel_client::proto::Log {
+            log: format!("[youtube-adapter] setup:\n{}", setup_log.trim_end()),
+            blob: vec![],
+        })),
     };
+    let mut lbuf = Vec::new();
+    if log.encode(&mut lbuf).is_ok() {
+        let mut w = write_ws_cockatiel.lock().await;
+        let _ = w.send(WsMessage::Binary(lbuf.into())).await;
+    }
+}
 
-    // Initialize gRPC transport layer connection. The channel is currently
+// Initialize gRPC transport layer connection. The channel is currently
 // unused (discarded), so this is best-effort and MUST NOT block chat
 // discovery — a gRPC failure just logs a warning and we continue with the
 // REST API polling.
 match tonic::transport::Channel::from_static("https://youtube.googleapis.com")
-    .tls_config(ClientTlsConfig::new())
+.tls_config(ClientTlsConfig::new())
 {
-    Ok(ch) => {
-        if let Err(e) = ch.connect().await {
-            warn!(
-                "YouTube gRPC transport unavailable ({}); continuing with REST API",
-                e
-            );
-        } else {
-            info!("Successfully connected to YouTube gRPC transport layer!");
-        }
-    }
-    Err(e) => {
+Ok(ch) => {
+    if let Err(e) = ch.connect().await {
         warn!(
-            "YouTube gRPC transport config failed ({}); continuing with REST API",
+            "YouTube gRPC transport unavailable ({}); continuing with REST API",
             e
         );
+    } else {
+        info!("Successfully connected to YouTube gRPC transport layer!");
     }
 }
+Err(e) => {
+    warn!(
+        "YouTube gRPC transport config failed ({}); continuing with REST API",
+        e
+    );
+}
+}
 
-    // Seamless loop: when a stream ends or disconnects, it automatically loops back to discover new streams
-    loop {
-        let streams = if !channel_id.is_empty() {
-            info!(
-                "Scanning for active and scheduled streams for channel ID: {}",
-                channel_id
-            );
-            match fetch_streams(&client, &channel_id, &key_manager, &unlisted_ids).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to fetch streams: {}. Retrying in 15 seconds...", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                    continue;
-                }
-            }
-        } else {
-            let mut s = Vec::new();
-            for vid in &unlisted_ids {
-                if let Ok(Some(info)) = fetch_video_stream(&client, vid, &key_manager).await {
-                    s.push(info);
-                }
-            }
-            s
-        };
-
-        let chosen_stream = match select_stream(
-            &streams,
-            &client,
-            &key_manager,
-            &mut unlisted_ids,
-            &channel_id,
-            &mut *write_ws_cockatiel.lock().await,
-            &mut prompt_rx,
-            &auth_token,
-            &module_name,
-            &instance_uuid,
-        )
-        .await
-        {
-            Some(s) => s,
-            None => {
-                info!("No streams currently found. Re-scanning in 30 seconds...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+// Seamless loop: when a stream ends or disconnects, it automatically loops back to discover new streams
+loop {
+    let streams = if !channel_id.is_empty() {
+        info!(
+            "Scanning for active and scheduled streams for channel ID: {}",
+            channel_id
+        );
+        match fetch_streams(&client, &channel_id, &key_manager, &unlisted_ids).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to fetch streams: {}. Retrying in 15 seconds...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                 continue;
             }
-        };
-
-        info!(
-            "Selected stream: {} ({})",
-            chosen_stream.title, chosen_stream.video_id
-        );
-
-        // Monitor stream live chat until the stream ends
-        monitor_stream_chat(
-            &mut *write_ws_cockatiel.lock().await,
-            &auth_token,
-            &module_name,
-            &instance_uuid,
-            &client,
-            &chosen_stream.video_id,
-            &key_manager,
-            &live_chat,
-        )
-        .await;
-
-        info!("Stream finished. Restarting discovery loop for seamless transition...");
         }
+    } else {
+        let mut s = Vec::new();
+        for vid in &unlisted_ids {
+            if let Ok(Some(info)) = fetch_video_stream(&client, vid, &key_manager).await {
+                s.push(info);
+            }
+        }
+        s
+    };
+
+    let chosen_stream = match select_stream(
+        &streams,
+        &client,
+        &key_manager,
+        &mut unlisted_ids,
+        &channel_id,
+        &mut *write_ws_cockatiel.lock().await,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+    )
+    .await
+    {
+        Some(s) => s,
+        None => {
+            info!("No streams currently found. Re-scanning in 30 seconds...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            continue;
+        }
+    };
+
+    info!(
+        "Selected stream: {} ({})",
+        chosen_stream.title, chosen_stream.video_id
+    );
+
+    // Monitor stream live chat until the stream ends
+    monitor_stream_chat(
+        &mut *write_ws_cockatiel.lock().await,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+        &client,
+        &chosen_stream.video_id,
+        &key_manager,
+        &live_chat,
+    )
+    .await;
+
+    info!("Stream finished. Restarting discovery loop for seamless transition...");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_tie_choice() {
+        assert_eq!(parse_tie_choice("t"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("retry"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try again"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("i"), Some(TieChoice::Ignore));
+        assert_eq!(parse_tie_choice("ignore"), Some(TieChoice::Ignore));
+        assert_eq!(parse_tie_choice("r"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("remove"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("e"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("EDIT"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("x"), None);
+        assert_eq!(parse_tie_choice(""), None);
+    }
 
     #[test]
     fn test_routed_command_maps_to_mod_query() {
