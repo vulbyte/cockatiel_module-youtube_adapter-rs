@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -446,6 +447,19 @@ fn load_oauth_redirect_port() -> u16 {
         .unwrap_or(3000)
 }
 
+/// Google's `expires_in` → access-token TTL in seconds. Google may return a
+/// value < 60 (or 0/missing); computing `expires_in - 60` raw would underflow
+/// to ~5.8e11 seconds and cache a token that effectively never refreshes.
+/// Saturate instead and fall back to the default 3600s when `expires_in` is
+/// absent/zero so the token is always refreshed early enough.
+fn access_token_ttl_secs(expires_in: i64) -> u64 {
+    if expires_in <= 0 {
+        3600
+    } else {
+        (expires_in as u64).saturating_sub(60)
+    }
+}
+
 /// Manages a Google OAuth2 token for `youtube.force-ssl`: acquires a refresh
 /// token via the browser flow (or accepts one pasted into the config), then
 /// mints/refreshes short-lived access tokens on demand.
@@ -561,7 +575,10 @@ impl OAuthManager {
 
         self.set_refresh_token(&refresh);
         if !access.is_empty() {
-            *self.access_token.lock().unwrap() = Some((access.to_string(), Instant::now() + std::time::Duration::from_secs(expires_in as u64 - 60)));
+            *self.access_token.lock().unwrap() = Some((
+                access.to_string(),
+                Instant::now() + std::time::Duration::from_secs(access_token_ttl_secs(expires_in)),
+            ));
         }
         Ok(refresh)
     }
@@ -606,7 +623,7 @@ impl OAuthManager {
         let expires_in = resp.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
         *self.access_token.lock().unwrap() = Some((
             access.clone(),
-            Instant::now() + std::time::Duration::from_secs(expires_in as u64 - 60),
+            Instant::now() + std::time::Duration::from_secs(access_token_ttl_secs(expires_in)),
         ));
         Ok(access)
     }
@@ -1661,6 +1678,45 @@ async fn send_to_youtube(
     }
 }
 
+/// Bounded set of recently-ingested live-chat message ids. Guards against
+/// re-ingesting the same messages when a poll request times out AFTER the
+/// server already processed it — the retry re-fetches the same page with the
+/// same `next_page_token` and would otherwise feed duplicates into the
+/// pipeline as brand-new empty-uuid MessagePreProcess messages. Keyed by the
+/// platform's per-message `id` from the poll items; pruned by insertion
+/// sequence to keep the set bounded (last ~10k ids).
+struct SeenMessageIds {
+    ids: HashMap<String, u64>,
+    next_seq: u64,
+    cap: usize,
+}
+
+impl SeenMessageIds {
+    fn new(cap: usize) -> Self {
+        Self {
+            ids: HashMap::new(),
+            next_seq: 0,
+            cap,
+        }
+    }
+
+    /// Record `id`; returns true if it was already seen (i.e. already
+    /// ingested in a prior poll of the same page).
+    fn is_seen(&mut self, id: &str) -> bool {
+        if self.ids.contains_key(id) {
+            return true;
+        }
+        self.ids.insert(id.to_string(), self.next_seq);
+        self.next_seq += 1;
+        // Prune the oldest entries by insertion sequence to stay bounded.
+        if self.ids.len() > self.cap {
+            let threshold = self.next_seq.saturating_sub(self.cap as u64);
+            self.ids.retain(|_, seq| *seq > threshold);
+        }
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
@@ -1762,6 +1818,18 @@ async fn monitor_stream_chat(
         chat_id
     );
     let mut next_page_token: Option<String> = None;
+    // Consecutive quota failures on the poll path. Once every configured key
+    // has failed in a row the whole ring is exhausted — hammering it every
+    // 500ms just burns quota-exhausted API calls, so back off and only resume
+    // fast polling once a key answers non-quota again.
+    let mut quota_failures: u32 = 0;
+    // Live-chat message ids already forwarded to the engine this session, so a
+    // timed-out poll retried with the same page token never re-ingests them.
+    let mut seen_ids = SeenMessageIds::new(10_000);
+    // Token of the last page successfully processed. If we re-poll that same
+    // token (a retry after a timeout) AND the items carry no usable ids, the
+    // page was already forwarded — skip it instead of re-ingesting.
+    let mut last_processed_token: Option<String> = None;
 
     loop {
         let api_key = keys.current_key();
@@ -1769,7 +1837,8 @@ async fn monitor_stream_chat(
             "https://www.googleapis.com/youtube/v3/liveChat/messages?liveChatId={}&part=snippet,authorDetails&key={}",
             chat_id, api_key
         );
-        if let Some(ref token) = next_page_token {
+        let requested_token = next_page_token.clone();
+        if let Some(ref token) = requested_token {
             chat_url.push_str(&format!("&pageToken={}", token));
         }
 
@@ -1779,11 +1848,26 @@ async fn monitor_stream_chat(
 
                 if let Ok(json) = res.json::<serde_json::Value>().await {
                     if ApiKeyManager::is_quota_error(&json) {
-                        warn!("API key quota exceeded while polling live chat messages. Rotating API key...");
+                        quota_failures += 1;
+                        let key_count = keys.key_count().max(1) as u32;
+                        warn!(
+                            "API key quota exceeded while polling live chat messages (failure {}/{}) — rotating API key...",
+                            quota_failures, key_count
+                        );
                         keys.rotate_to_next();
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        // Full ring rotated with no success: back off instead of
+                        // spinning every 500ms against a quota-exhausted API.
+                        let delay = if quota_failures >= key_count {
+                            info!("All configured API keys are quota-exhausted; backing off 60s before polling again.");
+                            std::time::Duration::from_secs(60)
+                        } else {
+                            std::time::Duration::from_millis(500)
+                        };
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
+                    // A non-quota response means at least one key is healthy.
+                    quota_failures = 0;
 
                     if status == reqwest::StatusCode::NOT_FOUND {
                         info!("Live chat closed (Not found).");
@@ -1821,8 +1905,26 @@ async fn monitor_stream_chat(
                         next_page_token = Some(new_token.to_string());
                     }
 
+                    // Re-poll of a page we already forwarded (no per-message ids
+                    // to dedup against): skip it — nothing new can be on it.
+                    let already_processed =
+                        requested_token.is_some() && requested_token == last_processed_token;
+
                     if let Some(items) = json.get("items").and_then(|i| i.as_array()) {
                         for item in items {
+                            // Skip messages already ingested (a timed-out poll
+                            // retried with the same page token).
+                            if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                                if seen_ids.is_seen(id) {
+                                    continue;
+                                }
+                            } else if already_processed {
+                                // No message ids available — fall back to the
+                                // page-level guard: this exact page was already
+                                // successfully forwarded, so skip its items.
+                                continue;
+                            }
+
                             let author = item
                                 .get("authorDetails")
                                 .and_then(|a| a.get("displayName"))
@@ -1877,6 +1979,11 @@ async fn monitor_stream_chat(
                             }
                         }
                     }
+
+                    // This page (identified by its requested token) was
+                    // successfully processed — a later retry of the same token
+                    // (e.g. after a timeout) must not re-forward it.
+                    last_processed_token = requested_token;
 
                     tokio::time::sleep(tokio::time::Duration::from_millis(interval)).await;
                 } else {
@@ -1937,11 +2044,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTP client (HTTP/1.1: reqwest's default HTTP/2 negotiation against
     // googleapis is flaky and produced "connection closed before message
-    // completed" errors).
+    // completed" errors). A 15s default timeout on EVERY request keeps a wedged
+    // TLS connection from stalling the discovery/chat-poll ingestion loop for
+    // minutes — the send path keeps its own explicit timeouts on top.
     let client = reqwest::Client::builder()
         .http1_only()
+        .timeout(Duration::from_secs(15))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| {
+            // Last-resort fallback: still bound every request so a wedged
+            // connection can never hang the ingestion loop indefinitely.
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        });
 
     // OAuth for sending: load app creds + any saved refresh token.
     let saved_cfg = load_adapter_config();
@@ -1986,9 +2103,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("YouTube sending disabled: set Google OAuth client id/secret (or a refresh token) in the credential form.");
     }
 
-    let oauth_task = oauth.clone();
-    let client_task = client.clone();
-    let live_chat_task = Arc::clone(&live_chat);
+    // Bounded SendToPlatforms queue: the read loop enqueues (never blocking, so
+    // an AuthVerify reply is never delayed by a slow `ensure_access_token`
+    // refresh + liveChat POST) and a single worker task posts to the live chat.
+    // Capacity 64 — a send flood is dropped with a warning rather than spawning
+    // unbounded tasks.
+    let (send_tx, mut send_rx) = mpsc::channel::<String>(64);
+    let oauth_worker = oauth.clone();
+    let client_worker = client.clone();
+    let live_chat_worker = Arc::clone(&live_chat);
+    tokio::spawn(async move {
+        while let Some(msg) = send_rx.recv().await {
+            match send_to_youtube(&oauth_worker, &client_worker, &live_chat_worker, &msg).await {
+                Ok(()) => info!("Sent to YouTube live chat: {}", msg),
+                Err(e) => error!("SendToPlatforms failed: {}", e),
+            }
+        }
+    });
+    let send_tx_task = send_tx;
+
     // Channel carrying PromptResponses from the engine to the stream loop,
     // so `prompt_for_input` can await the operator's typed answer.
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
@@ -2037,11 +2170,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = w.send(WsMessage::Binary(buf.into())).await;
                             }
                         }
-                        // SendToPlatforms handling: post to the active live chat.
+                        // SendToPlatforms handling: post to the active live chat. Offloaded to
+                        // the bounded worker task so the read loop returns
+                        // immediately — an inline `ensure_access_token` (token
+                        // refresh) + liveChat POST here would delay the
+                        // AuthVerify reply past the engine's 15s liveness probe
+                        // and get the module killed. `try_send` never blocks:
+                        // when the worker is saturated the message is dropped
+                        // (best-effort) instead of a flood spawning unbounded
+                        // tasks.
                         else if let Some(Payload::SendToPlatforms(send)) = container.payload {
-                            match send_to_youtube(&oauth_task, &client_task, &live_chat_task, &send.msg).await {
-                                Ok(()) => info!("Sent to YouTube live chat: {}", send.msg),
-                                Err(e) => error!("SendToPlatforms failed: {}", e),
+                            if send_tx_task.try_send(send.msg.clone()).is_err() {
+                                warn!("SendToPlatforms queue full; dropping message: {}", send.msg);
                             }
                         } else if let Some(Payload::PromptResponse(resp)) = container.payload {
                             // Forward operator answers to the awaiting prompt.
@@ -2076,6 +2216,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if query.encode(&mut qbuf).is_ok() {
                                     let mut w = write_task.lock().await;
                                     let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                }
+                            }
+                            // Ack the routed message with the SAME message_uuid7 so
+                            // the engine clears its pending-ack for this stage
+                            // (the raw ChatMessage is echoed back untouched — the
+                            // engine only keys on the uuid7 + module identity).
+                            // Without this the command message strands until the
+                            // engine's ack-timeout sweep. Sent on EVERY
+                            // routed-command path (query built or not).
+                            if !pre.message_uuid7.is_empty() {
+                                let ack = Container {
+                                    version: 1,
+                                    auth_token: auth,
+                                    module_name: module,
+                                    module_instance_uuid7: instance,
+                                    payload: Some(Payload::MessageAck(MessageAck {
+                                        message_uuid7: pre.message_uuid7,
+                                    })),
+                                };
+                                let mut abuf = Vec::new();
+                                if ack.encode(&mut abuf).is_ok() {
+                                    let mut w = write_task.lock().await;
+                                    let _ = w.send(WsMessage::Binary(abuf)).await;
                                 }
                             }
                         }
@@ -2688,6 +2851,38 @@ mod tests {
             }
         });
         assert!(!ApiKeyManager::is_quota_error(&other_err));
+    }
+
+    #[test]
+    fn test_access_token_ttl_secs() {
+        // Normal Google expiry: buffer 60s.
+        assert_eq!(access_token_ttl_secs(3600), 3540);
+        assert_eq!(access_token_ttl_secs(60), 0);
+        // expires_in < 60 must saturate, not underflow into ~5.8e11.
+        assert_eq!(access_token_ttl_secs(30), 0);
+        assert_eq!(access_token_ttl_secs(1), 0);
+        // Missing/zero expires_in falls back to the default 3600s.
+        assert_eq!(access_token_ttl_secs(0), 3600);
+        assert_eq!(access_token_ttl_secs(-5), 3600);
+    }
+
+    #[test]
+    fn test_seen_message_ids_dedup_and_prune() {
+        let mut seen = SeenMessageIds::new(3);
+        assert!(!seen.is_seen("m1"));
+        assert!(!seen.is_seen("m2"));
+        assert!(!seen.is_seen("m3"));
+        // Duplicates (a timed-out poll retried with the same page token).
+        assert!(seen.is_seen("m1"));
+        assert!(seen.is_seen("m2"));
+        // New message still passes.
+        assert!(!seen.is_seen("m4"));
+        // The set pruned the oldest entry — m1 is no longer remembered, so a
+        // re-poll after a full 10k-rotate would re-ingest it. Verify the bound
+        // holds and the newest ids survive.
+        assert!(!seen.is_seen("m1"));
+        assert!(seen.is_seen("m4"));
+        assert!(seen.is_seen("m3"));
     }
 
     #[tokio::test]
