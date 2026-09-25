@@ -473,9 +473,62 @@ fn build_mod_query(
     }
 }
 
+/// Backfill any missing tuning keys into `module_specific` with their defaults
+/// (creating config.json if it does not exist yet), so every setting is always
+/// present and editable in place. Leaves channel/api_keys/oauth/servers keys
+/// untouched. Best-effort: a read/write failure is ignored.
+fn backfill_tuning_defaults() {
+    backfill_tuning_defaults_at(&std::path::PathBuf::from("config.json"));
+}
+
+fn backfill_tuning_defaults_at(path: &std::path::Path) {
+    let mut json_val = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut ms = json_val
+        .get("module_specific")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let before = ms.clone();
+    let defaults: [(&str, i64); 19] = [
+        ("default_timeout_secs", 300),
+        ("http_timeout_secs", 15),
+        ("token_expiry_margin_secs", 60),
+        ("token_ttl_fallback_secs", 3600),
+        ("chat_open_max_attempts", 60),
+        ("chat_open_backoff_first_secs", 10),
+        ("chat_open_backoff_later_secs", 30),
+        ("dedup_cap", 10_000),
+        ("quota_backoff_secs", 60),
+        ("poll_retry_delay_ms", 500),
+        ("polling_interval_ms", 5000),
+        ("chat_poll_retry_secs", 5),
+        ("oauth_capture_timeout_secs", 120),
+        ("outbound_queue_cap", 64),
+        ("reconnect_base_secs", 1),
+        ("reconnect_max_secs", 30),
+        ("stream_fetch_retry_secs", 15),
+        ("stream_scan_interval_secs", 30),
+        ("prompt_timeout_secs", 300),
+    ];
+    for (key, value) in defaults {
+        if ms.get(key).is_none() {
+            ms[key] = serde_json::json!(value);
+        }
+    }
+    if ms != before {
+        json_val["module_specific"] = ms;
+        if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
+            let _ = std::fs::write(path, pretty);
+        }
+    }
+}
+
 fn load_adapter_config() -> Option<YoutubeAdapterConfig> {
     // Secrets live in `.env` (loaded into env at startup); channel/settings
-    // come from config.json.
+    // come from config.json. Ensure the tuning knobs exist on disk.
+    backfill_tuning_defaults();
     let settings: YoutubeAdapterConfig = std::fs::read_to_string("config.json")
         .ok()
         .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
@@ -3251,5 +3304,40 @@ mod tests {
         let streams = fetch_channel_streams_web(&client, "UCKZigHbgpJG9ldxXMqmiZUg").await;
         let found = streams.iter().any(|s| s.video_id == "1a2iSWQzl7I");
         assert!(found, "Expected to find scheduled stream 1a2iSWQzl7I in web streams: {:?}", streams);
+    }
+
+    #[test]
+    fn test_backfill_tuning_defaults_creates_and_preserves() {
+        let dir = std::env::temp_dir().join(format!("yt_backfill_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // Missing file: backfill creates it with every tuning default.
+        backfill_tuning_defaults_at(&path);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ms = root["module_specific"].as_object().unwrap();
+        assert_eq!(ms["default_timeout_secs"], 300);
+        assert_eq!(ms["http_timeout_secs"], 15);
+        assert_eq!(ms["dedup_cap"], 10_000);
+        assert_eq!(ms["prompt_timeout_secs"], 300);
+        assert_eq!(ms.len(), 19, "all tuning defaults present");
+
+        // Existing keys are preserved, missing ones are added, top-level fields survive.
+        std::fs::write(
+            &path,
+            r#"{"ip":"127.0.0.1","module_specific":{"default_timeout_secs":900}}"#,
+        )
+        .unwrap();
+        backfill_tuning_defaults_at(&path);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["ip"], "127.0.0.1", "top-level field preserved");
+        let ms = root["module_specific"].as_object().unwrap();
+        assert_eq!(ms["default_timeout_secs"], 900, "existing value preserved");
+        assert_eq!(ms["http_timeout_secs"], 15, "missing key backfilled");
+        assert_eq!(ms.len(), 19);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
