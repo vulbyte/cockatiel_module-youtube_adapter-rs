@@ -7,7 +7,7 @@ use serde_json::json;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2079,6 +2079,82 @@ impl SeenMessageIds {
     }
 }
 
+/// Exact engine-event message emitted when the monitored stream goes live.
+fn stream_start_message(video_id: &str, started_at: &str, title: &str) -> String {
+    format!(
+        "[stream-start] youtube: video '{}' went live at {} — title: \"{}\"",
+        video_id, started_at, title
+    )
+}
+
+/// Atomically claim the once-per-session stream-start event. Returns `true`
+/// for exactly one caller (the first to observe the stream live); every later
+/// caller gets `false` and must stay silent.
+fn claim_stream_start(fired: &AtomicBool) -> bool {
+    !fired.swap(true, Ordering::SeqCst)
+}
+
+/// Format a unix timestamp as an ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SSZ`).
+fn format_utc_iso(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let hh = rem / 3_600;
+    let mm = (rem % 3_600) / 60;
+    let ss = rem % 60;
+    // Howard Hinnant's civil-from-days conversion (proleptic Gregorian).
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y } as u64;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
+}
+
+/// The current wall-clock time as an ISO-8601 UTC string.
+fn utc_now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_utc_iso(secs)
+}
+
+/// Broadcast a Log container to the engine using the CURRENT session identity
+/// (read at send time so reconnects are honored) — the engine surfaces Logs to
+/// the TUI and persists them to the timeline.
+async fn send_stream_start_log(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    log: &str,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(Payload::Log(cockatiel_client::proto::Log {
+            log: log.to_string(),
+            blob: vec![],
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_ws.lock().await;
+        if let Err(e) = w.send(WsMessage::Binary(buf)).await {
+            error!("Failed to send to engine: {}", e);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
@@ -2090,6 +2166,10 @@ async fn monitor_stream_chat(
     tuning: &Tuning,
 ) {
     let mut attempt = 0u32;
+    // Fires the stream-start event exactly once per monitored session: the
+    // first path (Data API or watch-page fallback) to observe the stream live
+    // claims it atomically; every later poll is a no-op.
+    let stream_start_fired = AtomicBool::new(false);
     let chat_id = 'found_chat: loop {
         attempt += 1;
         if attempt > tuning.chat_open_max_attempts {
@@ -2102,7 +2182,7 @@ async fn monitor_stream_chat(
         let mut stream_ended = false;
         let api_key = keys.current_key();
         let video_url = format!(
-            "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails,status&id={}&key={}",
+            "https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails,status&id={}&key={}",
             video_id, api_key
         );
 
@@ -2131,6 +2211,22 @@ async fn monitor_stream_chat(
                                 if let Some(details) = item.get("liveStreamingDetails") {
                                     if let Some(id) = details.get("activeLiveChatId").and_then(|c| c.as_str()) {
                                         *live_chat.lock().unwrap() = Some(id.to_string());
+                                        // Stream went live: emit the start event once,
+                                        // carrying YouTube's actualStartTime verbatim.
+                                        if claim_stream_start(&stream_start_fired) {
+                                            let started_at = details
+                                                .get("actualStartTime")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("unknown");
+                                            let title = item
+                                                .get("snippet")
+                                                .and_then(|s| s.get("title"))
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("Untitled Stream");
+                                            let log = stream_start_message(video_id, started_at, title);
+                                            info!("{}", log);
+                                            send_stream_start_log(write_ws, identity, &log).await;
+                                        }
                                         break 'found_chat id.to_string();
                                     }
                                     if details.get("actualEndTime").is_some() {
@@ -2151,6 +2247,15 @@ async fn monitor_stream_chat(
         // 2. Keyless watch-page fallback: check isLive / isUpcoming.
         if let Ok(Some(stream_info)) = fetch_video_from_watch_page(client, video_id).await {
             if stream_info.status == "live" {
+                // Stream is live: emit the start event once, only if the Data
+                // API path hasn't already claimed it. The watch page carries no
+                // actualStartTime, so use the detection time (ISO UTC).
+                if claim_stream_start(&stream_start_fired) {
+                    let started_at = utc_now_iso();
+                    let log = stream_start_message(video_id, &started_at, &stream_info.title);
+                    info!("{}", log);
+                    send_stream_start_log(write_ws, identity, &log).await;
+                }
                 // Stream is live but we can't get the chat ID without the Data API.
                 // Log once and keep trying — the chat ID might become available if
                 // the user provides a real API key later.
@@ -3156,6 +3261,33 @@ mod tests {
         assert_eq!(parse_tie_choice("EDIT"), Some(TieChoice::Edit));
         assert_eq!(parse_tie_choice("x"), None);
         assert_eq!(parse_tie_choice(""), None);
+    }
+
+    #[test]
+    fn test_stream_start_message_format() {
+        assert_eq!(
+            stream_start_message("abc123", "2026-09-24T18:00:00Z", "My Stream"),
+            "[stream-start] youtube: video 'abc123' went live at 2026-09-24T18:00:00Z — title: \"My Stream\""
+        );
+        assert_eq!(
+            stream_start_message("abc123", "unknown", "My Stream"),
+            "[stream-start] youtube: video 'abc123' went live at unknown — title: \"My Stream\""
+        );
+    }
+
+    #[test]
+    fn test_stream_start_fires_once() {
+        let fired = AtomicBool::new(false);
+        assert!(claim_stream_start(&fired));
+        assert!(!claim_stream_start(&fired));
+        assert!(!claim_stream_start(&fired));
+    }
+
+    #[test]
+    fn test_format_utc_iso() {
+        assert_eq!(format_utc_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc_iso(86_400), "1970-01-02T00:00:00Z");
+        assert_eq!(format_utc_iso(1_704_067_200), "2024-01-01T00:00:00Z");
     }
 
     #[test]
