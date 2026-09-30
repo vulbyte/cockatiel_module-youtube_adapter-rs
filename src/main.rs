@@ -1129,7 +1129,6 @@ async fn fetch_video_stream(
 
                 let details = item.get("liveStreamingDetails");
                 let is_ended = details.and_then(|l| l.get("actualEndTime")).is_some();
-
                 if is_ended {
                     info!("Stream {} has already ended.", video_id);
                 } else {
@@ -1448,7 +1447,7 @@ fn extract_streams_from_json(val: &serde_json::Value, out: &mut Vec<StreamInfo>)
                                 title,
                                 status,
                                 published_at: "".to_string(),
-                            });
+                                    });
                         }
                     }
                 }
@@ -1481,7 +1480,7 @@ fn extract_streams_from_json(val: &serde_json::Value, out: &mut Vec<StreamInfo>)
                                 title,
                                 status,
                                 published_at: "".to_string(),
-                            });
+                                    });
                         }
                     }
                 }
@@ -1698,7 +1697,7 @@ async fn fetch_streams(
                                                         title,
                                                         status,
                                                         published_at,
-                                                    });
+                                                                                    });
                                                 }
                                             }
                                         }
@@ -2155,6 +2154,50 @@ async fn send_stream_start_log(
     }
 }
 
+/// Push this video's current viewer count to the engine via a `ChannelStats`
+/// payload. The engine stores it and serves it to other modules through the
+/// `channel_viewers` virtual query. Reads the session identity at send time.
+async fn push_channel_stats(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    platform: &str,
+    channel: &str,
+    viewers: i64,
+    is_live: bool,
+    title: &str,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(Payload::ChannelStats(cockatiel_client::proto::ChannelStats {
+            platform: platform.to_string(),
+            channel: channel.to_string(),
+            viewers,
+            is_live,
+            title: title.to_string(),
+            updated_at: now_unix_millis(),
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_ws.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
@@ -2211,6 +2254,29 @@ async fn monitor_stream_chat(
                                 if let Some(details) = item.get("liveStreamingDetails") {
                                     if let Some(id) = details.get("activeLiveChatId").and_then(|c| c.as_str()) {
                                         *live_chat.lock().unwrap() = Some(id.to_string());
+                                        // Push the current viewer count to the engine
+                                        // so other modules can read it via the
+                                        // channel_viewers query.
+                                        let viewers = details
+                                            .get("concurrentViewers")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .unwrap_or(0);
+                                        let title = item
+                                            .get("snippet")
+                                            .and_then(|s| s.get("title"))
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("");
+push_channel_stats(
+                                            write_ws,
+                                            identity,
+                                            "youtube",
+                                            video_id,
+                                            viewers,
+                                            true,
+                                            title,
+                                        )
+                                        .await;
                                         // Stream went live: emit the start event once,
                                         // carrying YouTube's actualStartTime verbatim.
                                         if claim_stream_start(&stream_start_fired) {
