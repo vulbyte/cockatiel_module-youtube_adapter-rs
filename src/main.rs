@@ -1,4 +1,7 @@
-use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, PromptKind};
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
+use cockatiel_client::proto::*;
+use cockatiel_client::{CockatielClient, PromptKind};
 use futures_util::{SinkExt, StreamExt as _};
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
@@ -47,12 +50,12 @@ async fn register_commands(
         let id = identity.lock().await;
         (id.auth.clone(), id.module.clone(), id.instance.clone())
     };
-    let commands = Container {
-        version: 1,
+    let commands = ContainerForEngine {
+        version: 2,
         auth_token: auth.clone(),
         module_name: module.clone(),
         module_instance_uuid7: instance.clone(),
-        payload: Some(Payload::CommandsPayload(Commands {
+        payload: Some(EnginePayload::Commands(Commands {
             commands: vec![
                 Command {
                     command_name: "ban".to_string(),
@@ -1781,12 +1784,12 @@ async fn prompt_for_input(
         input_label: input_label.to_string(),
         prompt_type: prompt_type as i32,
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth_token.to_string(),
         module_name: module_name.to_string(),
         module_instance_uuid7: instance_uuid.to_string(),
-        payload: Some(Payload::Prompt(prompt)),
+        payload: Some(EnginePayload::Prompt(prompt)),
     };
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_err() {
@@ -2135,12 +2138,12 @@ async fn send_stream_start_log(
         let id = identity.lock().await;
         (id.auth.clone(), id.module.clone(), id.instance.clone())
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth,
         module_name: module,
         module_instance_uuid7: instance,
-        payload: Some(Payload::Log(cockatiel_client::proto::Log {
+        payload: Some(EnginePayload::Log(cockatiel_client::proto::Log {
             log: log.to_string(),
             blob: vec![],
         })),
@@ -2170,12 +2173,12 @@ async fn push_channel_stats(
         let id = identity.lock().await;
         (id.auth.clone(), id.module.clone(), id.instance.clone())
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth,
         module_name: module,
         module_instance_uuid7: instance,
-        payload: Some(Payload::ChannelStats(cockatiel_client::proto::ChannelStats {
+        payload: Some(EnginePayload::ChannelStats(cockatiel_client::proto::ChannelStats {
             platform: platform.to_string(),
             channel: channel.to_string(),
             viewers,
@@ -2504,12 +2507,12 @@ push_channel_stats(
                                     let id = identity.lock().await;
                                     (id.auth.clone(), id.module.clone(), id.instance.clone())
                                 };
-                                let container = Container {
-                                    version: 1,
+                                let container = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth,
                                     module_name: module,
                                     module_instance_uuid7: instance,
-                                    payload: Some(Payload::MessagePreProcess(pre_process)),
+                                    payload: Some(EnginePayload::MessagePreProcess(pre_process)),
                                 };
                                 let mut buf = Vec::new();
                                 if container.encode(&mut buf).is_ok() {
@@ -2694,7 +2697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
-                    if let Ok(container) = Container::decode(data.as_ref()) {
+                    if let Ok(container) = ContainerForModule::decode(data.as_ref()) {
                         // Use the CURRENT session identity (a reconnect swaps it).
                         let (auth, instance, module) = {
                             let id = identity_task.lock().await;
@@ -2710,13 +2713,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Answer the engine's liveness probe with our auth token
                         // so a quiet period never severs us.
-                        if let Some(Payload::AuthVerify(_)) = container.payload {
-                            let reply = Container {
-                                version: 1,
+                        if let Some(ModulePayload::AuthVerify(_)) = container.payload {
+                            let reply = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth.clone(),
                                 module_name: module.clone(),
                                 module_instance_uuid7: instance.clone(),
-                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                     cur_auth: auth.clone(),
                                 })),
                             };
@@ -2735,17 +2738,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // when the worker is saturated the message is dropped
                         // (best-effort) instead of a flood spawning unbounded
                         // tasks.
-                        else if let Some(Payload::SendToPlatforms(send)) = container.payload {
+                        else if let Some(ModulePayload::SendToPlatforms(send)) = container.payload {
                             if send_tx_task.try_send(send.msg.clone()).is_err() {
                                 warn!("SendToPlatforms queue full; dropping message: {}", send.msg);
                             }
-                        } else if let Some(Payload::PromptResponse(resp)) = container.payload {
+                        } else if let Some(ModulePayload::PromptResponse(resp)) = container.payload {
                             // Forward operator answers to the awaiting prompt.
                             let _ = prompt_tx_task.send(resp);
                         }
                         // Routed chat command: the engine parsed `!ban` / `!timeout`
                         // and delivered it here with the parsed Command attached.
-                        else if let Some(Payload::MessagePreProcess(pre)) = container.payload {
+                        else if let Some(ModulePayload::MessagePreProcess(pre)) = container.payload {
                             let Some(chat) = pre.raw_message else { continue };
                             let Some(cmd) = chat.command else { continue };
                             if cmd.command_name != "ban" && cmd.command_name != "timeout" {
@@ -2762,12 +2765,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &author,
                                 tuning_task.default_timeout_secs,
                             ) {
-                                let query = Container {
-                                    version: 1,
+                                let query = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth.clone(),
                                     module_name: module.clone(),
                                     module_instance_uuid7: instance.clone(),
-                                    payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
                                         query_id: qid,
                                         sql: payload.to_string(),
                                         params: vec![],
@@ -2787,12 +2790,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // engine's ack-timeout sweep. Sent on EVERY
                             // routed-command path (query built or not).
                             if !pre.message_uuid7.is_empty() {
-                                let ack = Container {
-                                    version: 1,
+                                let ack = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth,
                                     module_name: module,
                                     module_instance_uuid7: instance,
-                                    payload: Some(Payload::MessageAck(MessageAck {
+                                    payload: Some(EnginePayload::MessageAck(MessageAck {
                                         message_uuid7: pre.message_uuid7,
                                     })),
                                 };
@@ -3192,12 +3195,12 @@ let channel_id: String = loop {
 
 // Surface the setup summary to the operator (the accumulated log).
 if !setup_log.trim().is_empty() {
-    let log = Container {
-        version: 1,
+    let log = ContainerForEngine {
+        version: 2,
         auth_token: auth_token.clone(),
         module_name: module_name.clone(),
         module_instance_uuid7: instance_uuid.clone(),
-        payload: Some(Payload::Log(cockatiel_client::proto::Log {
+        payload: Some(EnginePayload::Log(cockatiel_client::proto::Log {
             log: format!("[youtube-adapter] setup:\n{}", setup_log.trim_end()),
             blob: vec![],
         })),
