@@ -99,80 +99,80 @@ struct YoutubeAdapterConfig {
     // previous hardcoded constant when the key is missing from config.json,
     // so an absent setting behaves exactly as before.
     #[serde(default = "YoutubeAdapterConfig::default_timeout_secs")]
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
     #[serde(default = "YoutubeAdapterConfig::http_timeout_secs")]
-    http_timeout_secs: u64,
+    http_timeout_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::token_expiry_margin_secs")]
-    token_expiry_margin_secs: u64,
+    token_expiry_margin_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::token_ttl_fallback_secs")]
-    token_ttl_fallback_secs: u64,
+    token_ttl_fallback_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::chat_open_max_attempts")]
     chat_open_max_attempts: u32,
     #[serde(default = "YoutubeAdapterConfig::chat_open_backoff_first_secs")]
-    chat_open_backoff_first_secs: u64,
+    chat_open_backoff_first_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::chat_open_backoff_later_secs")]
-    chat_open_backoff_later_secs: u64,
+    chat_open_backoff_later_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::dedup_cap")]
     dedup_cap: usize,
     #[serde(default = "YoutubeAdapterConfig::quota_backoff_secs")]
-    quota_backoff_secs: u64,
+    quota_backoff_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::poll_retry_delay_ms")]
-    poll_retry_delay_ms: u64,
+    poll_retry_delay_ms: u32,
     #[serde(default = "YoutubeAdapterConfig::polling_interval_ms")]
-    polling_interval_ms: u64,
+    polling_interval_ms: u32,
     #[serde(default = "YoutubeAdapterConfig::chat_poll_retry_secs")]
-    chat_poll_retry_secs: u64,
+    chat_poll_retry_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::oauth_capture_timeout_secs")]
     oauth_capture_timeout_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::outbound_queue_cap")]
     outbound_queue_cap: usize,
     #[serde(default = "YoutubeAdapterConfig::reconnect_base_secs")]
-    reconnect_base_secs: u64,
+    reconnect_base_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::reconnect_max_secs")]
-    reconnect_max_secs: u64,
+    reconnect_max_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::stream_fetch_retry_secs")]
-    stream_fetch_retry_secs: u64,
+    stream_fetch_retry_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::stream_scan_interval_secs")]
-    stream_scan_interval_secs: u64,
+    stream_scan_interval_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::prompt_timeout_secs")]
     prompt_timeout_secs: u32,
 }
 
 impl YoutubeAdapterConfig {
-    fn default_timeout_secs() -> i64 {
+    fn default_timeout_secs() -> i32 {
         300
     }
-    fn http_timeout_secs() -> u64 {
+    fn http_timeout_secs() -> u32 {
         15
     }
-    fn token_expiry_margin_secs() -> u64 {
+    fn token_expiry_margin_secs() -> u32 {
         60
     }
-    fn token_ttl_fallback_secs() -> u64 {
+    fn token_ttl_fallback_secs() -> u32 {
         3600
     }
     fn chat_open_max_attempts() -> u32 {
         60
     }
-    fn chat_open_backoff_first_secs() -> u64 {
+    fn chat_open_backoff_first_secs() -> u32 {
         10
     }
-    fn chat_open_backoff_later_secs() -> u64 {
+    fn chat_open_backoff_later_secs() -> u32 {
         30
     }
     fn dedup_cap() -> usize {
         10_000
     }
-    fn quota_backoff_secs() -> u64 {
+    fn quota_backoff_secs() -> u32 {
         60
     }
-    fn poll_retry_delay_ms() -> u64 {
+    fn poll_retry_delay_ms() -> u32 {
         500
     }
-    fn polling_interval_ms() -> u64 {
+    fn polling_interval_ms() -> u32 {
         5000
     }
-    fn chat_poll_retry_secs() -> u64 {
+    fn chat_poll_retry_secs() -> u32 {
         5
     }
     fn oauth_capture_timeout_secs() -> u32 {
@@ -181,16 +181,16 @@ impl YoutubeAdapterConfig {
     fn outbound_queue_cap() -> usize {
         64
     }
-    fn reconnect_base_secs() -> u64 {
+    fn reconnect_base_secs() -> u32 {
         1
     }
-    fn reconnect_max_secs() -> u64 {
+    fn reconnect_max_secs() -> u32 {
         30
     }
-    fn stream_fetch_retry_secs() -> u64 {
+    fn stream_fetch_retry_secs() -> u32 {
         15
     }
-    fn stream_scan_interval_secs() -> u64 {
+    fn stream_scan_interval_secs() -> u32 {
         30
     }
     fn prompt_timeout_secs() -> u32 {
@@ -236,24 +236,24 @@ impl Default for YoutubeAdapterConfig {
 /// held the hardcoded literals.
 #[derive(Debug, Clone)]
 struct Tuning {
-    default_timeout_secs: i64,
-    http_timeout_secs: u64,
-    token_expiry_margin_secs: u64,
-    token_ttl_fallback_secs: u64,
+    default_timeout_secs: i32,
+    http_timeout_secs: u32,
+    token_expiry_margin_secs: u32,
+    token_ttl_fallback_secs: u32,
     chat_open_max_attempts: u32,
-    chat_open_backoff_first_secs: u64,
-    chat_open_backoff_later_secs: u64,
+    chat_open_backoff_first_secs: u32,
+    chat_open_backoff_later_secs: u32,
     dedup_cap: usize,
-    quota_backoff_secs: u64,
-    poll_retry_delay_ms: u64,
-    polling_interval_ms: u64,
-    chat_poll_retry_secs: u64,
+    quota_backoff_secs: u32,
+    poll_retry_delay_ms: u32,
+    polling_interval_ms: u32,
+    chat_poll_retry_secs: u32,
     oauth_capture_timeout_secs: u32,
     outbound_queue_cap: usize,
-    reconnect_base_secs: u64,
-    reconnect_max_secs: u64,
-    stream_fetch_retry_secs: u64,
-    stream_scan_interval_secs: u64,
+    reconnect_base_secs: u32,
+    reconnect_max_secs: u32,
+    stream_fetch_retry_secs: u32,
+    stream_scan_interval_secs: u32,
     prompt_timeout_secs: u32,
 }
 
@@ -417,7 +417,7 @@ fn build_mod_query(
     command_name: &str,
     message: &str,
     author: &str,
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
 ) -> Option<(String, serde_json::Value)> {
     let mut tokens = message.trim().split_whitespace();
     let _cmd = tokens.next()?;
@@ -446,7 +446,7 @@ fn build_mod_query(
             let mut duration_secs = default_timeout_secs;
             let mut reason = String::new();
             if let Some(d) = tokens.next() {
-                if let Ok(secs) = d.parse::<i64>() {
+                if let Ok(secs) = d.parse::<i32>() {
                     duration_secs = secs;
                 } else {
                     reason = d.to_string();
@@ -494,7 +494,7 @@ fn backfill_tuning_defaults_at(path: &std::path::Path) {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
-    let defaults: [(&str, i64); 19] = [
+    let defaults: [(&str, i32); 19] = [
         ("default_timeout_secs", 300),
         ("http_timeout_secs", 15),
         ("token_expiry_margin_secs", 60),
@@ -794,11 +794,11 @@ fn load_oauth_redirect_port() -> u16 {
 /// refreshes. Saturate instead and fall back to the configured default TTL
 /// when `expires_in` is absent/zero so the token is always refreshed early
 /// enough.
-fn access_token_ttl_secs(expires_in: i64, margin_secs: u64, fallback_secs: u64) -> u64 {
+fn access_token_ttl_secs(expires_in: i32, margin_secs: u32, fallback_secs: u32) -> u32 {
     if expires_in <= 0 {
         fallback_secs
     } else {
-        (expires_in as u64).saturating_sub(margin_secs)
+        (expires_in as u32).saturating_sub(margin_secs)
     }
 }
 
@@ -810,8 +810,8 @@ struct OAuthManager {
     client_id: String,
     client_secret: String,
     oauth_redirect_port: u16,
-    token_expiry_margin_secs: u64,
-    token_ttl_fallback_secs: u64,
+    token_expiry_margin_secs: u32,
+    token_ttl_fallback_secs: u32,
     refresh_token: Arc<Mutex<Option<String>>>,
     access_token: Arc<Mutex<Option<(String, Instant)>>>,
 }
@@ -822,8 +822,8 @@ impl OAuthManager {
         client_secret: &str,
         refresh_token: Option<String>,
         oauth_redirect_port: u16,
-        token_expiry_margin_secs: u64,
-        token_ttl_fallback_secs: u64,
+        token_expiry_margin_secs: u32,
+        token_ttl_fallback_secs: u32,
     ) -> Self {
         Self {
             client_id: client_id.to_string(),
@@ -922,7 +922,8 @@ impl OAuthManager {
         let expires_in = resp
             .get("expires_in")
             .and_then(|v| v.as_i64())
-            .unwrap_or(self.token_ttl_fallback_secs as i64);
+            .map(|v| v as i32)
+            .unwrap_or(self.token_ttl_fallback_secs as i32);
 
         self.set_refresh_token(&refresh);
         if !access.is_empty() {
@@ -933,7 +934,7 @@ impl OAuthManager {
                         expires_in,
                         self.token_expiry_margin_secs,
                         self.token_ttl_fallback_secs,
-                    )),
+                    ) as u64),
             ));
         }
         Ok(refresh)
@@ -979,7 +980,8 @@ impl OAuthManager {
         let expires_in = resp
             .get("expires_in")
             .and_then(|v| v.as_i64())
-            .unwrap_or(self.token_ttl_fallback_secs as i64);
+            .map(|v| v as i32)
+            .unwrap_or(self.token_ttl_fallback_secs as i32);
         *self.access_token.lock().unwrap() = Some((
             access.clone(),
             Instant::now()
@@ -987,7 +989,7 @@ impl OAuthManager {
                     expires_in,
                     self.token_expiry_margin_secs,
                     self.token_ttl_fallback_secs,
-                )),
+                ) as u64),
         ));
         Ok(access)
     }
@@ -2352,7 +2354,7 @@ push_channel_stats(
         } else {
             tuning.chat_open_backoff_later_secs
         };
-        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
     };
 
     info!(
@@ -2401,9 +2403,9 @@ push_channel_stats(
                         // spinning every 500ms against a quota-exhausted API.
                         let delay = if quota_failures >= key_count {
                             info!("All configured API keys are quota-exhausted; backing off {}s before polling again.", tuning.quota_backoff_secs);
-                            std::time::Duration::from_secs(tuning.quota_backoff_secs)
+                            std::time::Duration::from_secs(tuning.quota_backoff_secs as u64)
                         } else {
-                            std::time::Duration::from_millis(tuning.poll_retry_delay_ms)
+                            std::time::Duration::from_millis(tuning.poll_retry_delay_ms as u64)
                         };
                         tokio::time::sleep(delay).await;
                         continue;
@@ -2434,7 +2436,7 @@ push_channel_stats(
                             break;
                         } else {
                             tokio::time::sleep(tokio::time::Duration::from_secs(
-                                tuning.chat_poll_retry_secs,
+                                tuning.chat_poll_retry_secs as u64,
                             ))
                             .await;
                             continue;
@@ -2444,6 +2446,7 @@ push_channel_stats(
                     let interval = json
                         .get("pollingIntervalMillis")
                         .and_then(|v| v.as_u64())
+                        .map(|v| v as u32)
                         .unwrap_or(tuning.polling_interval_ms);
 
                     if let Some(new_token) = json.get("nextPageToken").and_then(|v| v.as_str()) {
@@ -2530,7 +2533,7 @@ push_channel_stats(
                     // (e.g. after a timeout) must not re-forward it.
                     last_processed_token = requested_token;
 
-                    tokio::time::sleep(tokio::time::Duration::from_millis(interval)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(interval as u64)).await;
                 } else {
                     if status == reqwest::StatusCode::FORBIDDEN
                         || status == reqwest::StatusCode::NOT_FOUND
@@ -2539,7 +2542,7 @@ push_channel_stats(
                         break;
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(
-                        tuning.chat_poll_retry_secs,
+                        tuning.chat_poll_retry_secs as u64,
                     ))
                     .await;
                 }
@@ -2547,7 +2550,7 @@ push_channel_stats(
             Err(e) => {
                 error!("Error polling chat: {}. Retrying...", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(
-                    tuning.chat_poll_retry_secs,
+                    tuning.chat_poll_retry_secs as u64,
                 ))
                 .await;
             }
@@ -2606,13 +2609,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // minutes — the send path keeps its own explicit timeouts on top.
     let client = reqwest::Client::builder()
         .http1_only()
-        .timeout(Duration::from_secs(tuning.http_timeout_secs))
+        .timeout(Duration::from_secs(tuning.http_timeout_secs as u64))
         .build()
         .unwrap_or_else(|_| {
             // Last-resort fallback: still bound every request so a wedged
             // connection can never hang the ingestion loop indefinitely.
             reqwest::Client::builder()
-                .timeout(Duration::from_secs(tuning.http_timeout_secs))
+                .timeout(Duration::from_secs(tuning.http_timeout_secs as u64))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         });
@@ -2846,7 +2849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Engine disconnected — reconnecting...");
             let mut backoff = tuning_task.reconnect_base_secs;
             loop {
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                 match CockatielClient::connect("config.json").await {
                     Ok(conn) => {
                         info!("Reconnected to engine");
@@ -3270,7 +3273,7 @@ loop {
             Err(e) => {
                 error!("Failed to fetch streams: {}. Retrying in {} seconds...", e, tuning.stream_fetch_retry_secs);
                 tokio::time::sleep(tokio::time::Duration::from_secs(
-                    tuning.stream_fetch_retry_secs,
+                    tuning.stream_fetch_retry_secs as u64,
                 ))
                 .await;
                 continue;
@@ -3305,7 +3308,7 @@ loop {
         None => {
             info!("No streams currently found. Re-scanning in {} seconds...", tuning.stream_scan_interval_secs);
             tokio::time::sleep(tokio::time::Duration::from_secs(
-                tuning.stream_scan_interval_secs,
+                tuning.stream_scan_interval_secs as u64,
             ))
             .await;
             continue;
