@@ -2749,8 +2749,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Routed chat command: the engine parsed `!ban` / `!timeout`
                         // and delivered it here with the parsed Command attached.
                         else if let Some(ModulePayload::MessagePreProcess(pre)) = container.payload {
+                            // Receipt ping: confirm delivery to the engine
+                            // IMMEDIATELY (pure ack, separate from the stage
+                            // echo below) so the engine doesn't resend.
+                            if !pre.message_uuid7.is_empty() {
+                                let receipt = ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth.clone(),
+                                    module_name: module.clone(),
+                                    module_instance_uuid7: instance.clone(),
+                                    payload: Some(EnginePayload::MessageAck(MessageAck {
+                                        message_uuid7: pre.message_uuid7.clone(),
+                                    })),
+                                };
+                                let mut rbuf = Vec::new();
+                                if receipt.encode(&mut rbuf).is_ok() {
+                                    let mut w = write_task.lock().await;
+                                    let _ = w.send(WsMessage::Binary(rbuf)).await;
+                                }
+                            }
                             let Some(chat) = pre.raw_message else { continue };
-                            let Some(cmd) = chat.command else { continue };
+                            let Some(cmd) = chat.command.clone() else { continue };
                             if cmd.command_name != "ban" && cmd.command_name != "timeout" {
                                 continue;
                             }
@@ -2782,27 +2801,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = w.send(WsMessage::Binary(qbuf.into())).await;
                                 }
                             }
-                            // Ack the routed message with the SAME message_uuid7 so
-                            // the engine clears its pending-ack for this stage
-                            // (the raw ChatMessage is echoed back untouched — the
-                            // engine only keys on the uuid7 + module identity).
-                            // Without this the command message strands until the
-                            // engine's ack-timeout sweep. Sent on EVERY
-                            // routed-command path (query built or not).
+                            // Stage result: echo the MessagePreProcess back with the
+                            // SAME message_uuid7 so the pipeline advances — the
+                            // MessageAck above is a pure receipt, NOT a result. Sent
+                            // on EVERY routed-command path (query built or not).
+                            // Never with an empty uuid7: the engine treats that as a
+                            // NEW message ingest.
                             if !pre.message_uuid7.is_empty() {
-                                let ack = ContainerForEngine {
+                                let result = ContainerForEngine {
                                     version: 2,
                                     auth_token: auth,
                                     module_name: module,
                                     module_instance_uuid7: instance,
-                                    payload: Some(EnginePayload::MessageAck(MessageAck {
+                                    payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
                                         message_uuid7: pre.message_uuid7,
+                                        raw_message: Some(chat),
+                                        audio: pre.audio,
+                                        audio_type: pre.audio_type,
                                     })),
                                 };
-                                let mut abuf = Vec::new();
-                                if ack.encode(&mut abuf).is_ok() {
+                                let mut rbuf = Vec::new();
+                                if result.encode(&mut rbuf).is_ok() {
                                     let mut w = write_task.lock().await;
-                                    let _ = w.send(WsMessage::Binary(abuf)).await;
+                                    let _ = w.send(WsMessage::Binary(rbuf)).await;
                                 }
                             }
                         }
