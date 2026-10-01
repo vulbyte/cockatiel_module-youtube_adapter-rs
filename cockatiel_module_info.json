@@ -25,6 +25,7 @@
   ],
   "capabilities": "input",
   "command_flags": [
+    "run",
     "--release"
   ],
   "credentials": [
@@ -76,7 +77,7 @@
     }
   ],
   "description": "a module for getting and sending messages to youtube",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "min_rank": 0,
   "name": "youtube-adapter",
   "price": 0,
