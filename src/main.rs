@@ -2167,7 +2167,7 @@ async fn push_channel_stats(
     identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
     platform: &str,
     channel: &str,
-    viewers: i64,
+    viewers: i32,
     is_live: bool,
     title: &str,
 ) {
@@ -2265,7 +2265,7 @@ async fn monitor_stream_chat(
                                         let viewers = details
                                             .get("concurrentViewers")
                                             .and_then(|v| v.as_str())
-                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .and_then(|s| s.parse::<i32>().ok())
                                             .unwrap_or(0);
                                         let title = item
                                             .get("snippet")
