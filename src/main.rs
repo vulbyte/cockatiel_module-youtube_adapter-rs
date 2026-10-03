@@ -2302,7 +2302,18 @@ async fn monitor_stream_chat(
         match client.get(&video_url).send().await {
             Ok(res) => {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
-                    if !ApiKeyManager::is_quota_error(&json) {
+                    if ApiKeyManager::is_quota_error(&json) {
+                        // The current key is exhausted: rotate to the next one so
+                        // a healthy key can resolve the stream's activeLiveChatId.
+                        // Without this the adapter sticks on the first (exhausted)
+                        // key forever and can never enter live-chat monitoring.
+                        if attempt == 1 {
+                            warn!("Data API quota exceeded for video status — rotating to the next key.");
+                        }
+                        keys.rotate_to_next();
+                        // Fall through to the watch-page check below; the next
+                        // loop iteration uses the rotated key.
+                    } else if !ApiKeyManager::is_quota_error(&json) {
                         if let Some(err) = json.get("error") {
                             // API key invalid or other error — fall through to watch-page check.
                             if attempt == 1 {
