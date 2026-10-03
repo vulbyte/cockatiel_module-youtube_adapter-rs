@@ -2409,12 +2409,26 @@ async fn monitor_stream_chat(
                     );
                 }
             } else {
-                // Upcoming — wait and retry.
+                // Upcoming — wait and retry. Surface the wait state to the
+                // operator (via the engine log) once so term-chat / the TUI
+                // shows what the adapter is doing instead of a silent void:
+                // the stream is scheduled, and chat will begin when it goes live.
                 if attempt % 6 == 1 {
                     info!(
                         "Stream '{}' is upcoming ({}). Waiting for it to go live...",
                         stream_info.title, stream_info.status
                     );
+                    if attempt == 1 {
+                        send_stream_start_log(
+                            write_ws,
+                            identity,
+                            &format!(
+                                "[youtube] monitoring scheduled stream '{}' ({}) — chat will appear when it goes live",
+                                stream_info.title, video_id
+                            ),
+                        )
+                        .await;
+                    }
                 }
             }
         }
