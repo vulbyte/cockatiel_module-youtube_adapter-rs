@@ -1792,6 +1792,24 @@ async fn fetch_streams(
         }
     }
 
+    // 5. Enrich every discovered stream with its REAL scheduled start time (and
+    // the chat id) via the Data API `videos` endpoint. Search items carry the
+    // publish date, not the scheduled start — ordering a prompt by publish date
+    // puts an old test stream ahead of the one actually starting soonest. The
+    // `videos` call is cheap (a handful of streams) and replaces the record in
+    // place so the chronological sort below sees true start times.
+    for stream in all_streams.iter_mut() {
+        if let Ok(Some(enriched)) = fetch_video_stream(client, &stream.video_id, keys).await {
+            stream.status = enriched.status;
+            if !enriched.scheduled_start.is_empty() {
+                stream.scheduled_start = enriched.scheduled_start;
+            }
+            if !enriched.title.is_empty() {
+                stream.title = enriched.title;
+            }
+        }
+    }
+
     Ok(all_streams)
 }
 
@@ -3773,6 +3791,34 @@ mod tests {
         let order: Vec<&str> = sorted.iter().map(|s| s.video_id.as_str()).collect();
         // Live first, then upcoming soonest → furthest.
         assert_eq!(order, vec!["live1", "soon", "mid", "far"], "chronological order");
+    }
+
+    #[test]
+    fn test_stream_sort_uses_scheduled_start_not_publish_date() {
+        // The enrichment step (fetch_streams step 5) fills in scheduled_start
+        // from the Data API's scheduledStartTime. Without it the sort would use
+        // the publish date — which for a stale test stream published earlier
+        // can be older than the REAL soonest stream. This is the ordering that
+        // matters tonight: the soonest-scheduled stream must come first.
+        let mk = |id: &str, published: &str, start: &str| StreamInfo {
+            video_id: id.into(),
+            title: format!("Stream {id}"),
+            status: "upcoming".into(),
+            published_at: published.into(),
+            scheduled_start: start.into(),
+        };
+        // "test stream" was published 2026-09-29 but schedules in 2028; PROJECT
+        // PITT was published later (2026-10-03) and starts tonight at 22:30Z.
+        let streams = vec![
+            mk("test-stream", "2026-09-29T06:40:00Z", "2028-09-29T06:40:00Z"),
+            mk("project-pitt", "2026-10-03T17:49:28Z", "2026-10-03T22:30:00Z"),
+        ];
+        let sorted = sort_streams_chronologically(&streams);
+        assert_eq!(
+            sorted[0].video_id, "project-pitt",
+            "the stream starting soonest must sort first, not the one published earlier"
+        );
+        assert_eq!(sorted[1].video_id, "test-stream");
     }
 
     #[test]
