@@ -2311,9 +2311,7 @@ async fn monitor_stream_chat(
                             warn!("Data API quota exceeded for video status — rotating to the next key.");
                         }
                         keys.rotate_to_next();
-                        // Fall through to the watch-page check below; the next
-                        // loop iteration uses the rotated key.
-                    } else if !ApiKeyManager::is_quota_error(&json) {
+                    } else {
                         if let Some(err) = json.get("error") {
                             // API key invalid or other error — fall through to watch-page check.
                             if attempt == 1 {
@@ -2348,7 +2346,7 @@ async fn monitor_stream_chat(
                                             .and_then(|s| s.get("title"))
                                             .and_then(|t| t.as_str())
                                             .unwrap_or("");
-push_channel_stats(
+                                        push_channel_stats(
                                             write_ws,
                                             identity,
                                             "youtube",
@@ -2383,8 +2381,6 @@ push_channel_stats(
                                 }
                             }
                         }
-                    } else if attempt == 1 {
-                        warn!("Data API quota exhausted — using watch-page fallback for stream status.");
                     }
                 }
             }
