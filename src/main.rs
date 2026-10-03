@@ -1775,6 +1775,43 @@ async fn fetch_streams(
 /// for the answer — holding it across the wait would block the read loop's
 /// AuthVerify reply and make the module look unresponsive to the engine's
 /// liveness probe (which severs it).
+/// Inform the operator (via a Boolean prompt) that every configured YouTube API
+/// key is quota-exhausted, so chat monitoring is paused until the quota resets.
+/// Fires once per monitored session (`notified` guards it). The prompt requires
+/// acknowledgment — it does not block the poll loop (a timeout just continues).
+async fn notify_all_keys_exhausted(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    timeout_secs: u32,
+    notified: &mut bool,
+) {
+    if *notified {
+        return;
+    }
+    *notified = true;
+    let _ = prompt_for_input(
+        write_ws,
+        prompt_rx,
+        auth_token,
+        module_name,
+        instance_uuid,
+        "YouTube API quota exhausted",
+        "All configured YouTube Data API keys have hit their quota, so live chat \
+         monitoring is paused.\n\n\
+         The quota resets automatically (typically every 24h, or per-request budget). \
+         The adapter will keep trying and resume chat automatically once a key is \
+         available again.\n\n\
+         Press OK to acknowledge. If this keeps happening, add more API keys (module \
+         row > C > 'API Keys — one per line').",
+        "Acknowledge",
+        PromptKind::Boolean,
+        timeout_secs,
+    )
+    .await;
+}
 async fn prompt_for_input(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
@@ -2233,12 +2270,19 @@ async fn monitor_stream_chat(
     keys: &ApiKeyManager,
     live_chat: &Arc<Mutex<Option<String>>>,
     tuning: &Tuning,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
 ) {
     let mut attempt = 0u32;
     // Fires the stream-start event exactly once per monitored session: the
     // first path (Data API or watch-page fallback) to observe the stream live
     // claims it atomically; every later poll is a no-op.
     let stream_start_fired = AtomicBool::new(false);
+    // Whether the "all API keys exhausted" acknowledgment prompt has been shown
+    // this session. Shown once so the operator isn't spammed every backoff.
+    let mut notified_exhausted = false;
     let chat_id = 'found_chat: loop {
         attempt += 1;
         if attempt > tuning.chat_open_max_attempts {
@@ -2424,6 +2468,20 @@ push_channel_stats(
                         // spinning every 500ms against a quota-exhausted API.
                         let delay = if quota_failures >= key_count {
                             info!("All configured API keys are quota-exhausted; backing off {}s before polling again.", tuning.quota_backoff_secs);
+                            // Surface it to the operator ONCE per session: a
+                            // Boolean prompt they must acknowledge so they know
+                            // chat monitoring is paused on API limits (the keys
+                            // will recover on their own when quota resets).
+                            notify_all_keys_exhausted(
+                                write_ws,
+                                prompt_rx,
+                                auth_token,
+                                module_name,
+                                instance_uuid,
+                                tuning.prompt_timeout_secs,
+                                &mut notified_exhausted,
+                            )
+                            .await;
                             std::time::Duration::from_secs(tuning.quota_backoff_secs as u64)
                         } else {
                             std::time::Duration::from_millis(tuning.poll_retry_delay_ms as u64)
@@ -3350,6 +3408,10 @@ loop {
         &key_manager,
         &live_chat,
         &tuning,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
     )
     .await;
 
