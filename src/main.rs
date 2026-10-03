@@ -1212,7 +1212,14 @@ async fn fetch_video_from_watch_page(
         .and_then(|p| p.get("status"))
         .and_then(|s| s.as_str())
     {
-        if status != "OK" {
+        // LIVE_STREAM_OFFLINE is the playability status a SCHEDULED / upcoming
+        // live stream reports until it actually starts broadcasting. It is NOT
+        // an error: the adapter must keep waiting for the stream to go live.
+        // Treat it as playable so the isLive/isUpcoming detection below runs
+        // and the monitor loop enters its "waiting for go-live" retry instead
+        // of silently giving up on a stream that simply hasn't started.
+        let is_scheduled_offline = status == "LIVE_STREAM_OFFLINE";
+        if status != "OK" && !is_scheduled_offline {
             info!(
                 "Video {} is not playable (status={}); not a public/unlisted stream.",
                 video_id, status
@@ -1231,6 +1238,11 @@ async fn fetch_video_from_watch_page(
         .to_string();
     let is_live = vd.get("isLive").and_then(|v| v.as_bool()).unwrap_or(false);
     let has_live_details = vd.get("liveBroadcastDetails").is_some();
+    // YouTube sets BOTH isLive and isUpcoming on a scheduled stream that has
+    // not started broadcasting yet (isLive merely means "it is a live event",
+    // not "it is on air"). isUpcoming is the authoritative "scheduled, waiting
+    // to go live" flag, so it must win over the isLive quirk — otherwise a
+    // scheduled stream is misreported as live and the monitor stops waiting.
     let is_upcoming = vd
         .get("isUpcoming")
         .and_then(|v| v.as_bool())
@@ -1250,7 +1262,16 @@ async fn fetch_video_from_watch_page(
     Ok(Some(StreamInfo {
         video_id: video_id.to_string(),
         title,
-        status: if is_live { "live" } else { "upcoming" }.to_string(),
+        // isUpcoming wins: a scheduled stream is "upcoming" until it actually
+        // broadcasts, even though the page also sets isLive on it.
+        status: if is_upcoming {
+            "upcoming"
+        } else if is_live {
+            "live"
+        } else {
+            "upcoming"
+        }
+        .to_string(),
         published_at,
     }))
 }
@@ -3569,8 +3590,22 @@ mod tests {
     async fn test_fetch_channel_streams_web() {
         let client = reqwest::Client::new();
         let streams = fetch_channel_streams_web(&client, "UCKZigHbgpJG9ldxXMqmiZUg").await;
-        let found = streams.iter().any(|s| s.video_id == "1a2iSWQzl7I");
-        assert!(found, "Expected to find scheduled stream 1a2iSWQzl7I in web streams: {:?}", streams);
+        // The channel currently has two scheduled (upcoming) streams. Rather
+        // than pin a video id that changes every stream, assert the discovery
+        // found the channel's known scheduled streams (any of the set that is
+        // live today) and that everything it found is a live/upcoming stream.
+        let known_ids = ["He1xn2br40c", "hHyw0Rkp4SI", "1a2iSWQzl7I"];
+        let found_any_known = streams.iter().any(|s| known_ids.contains(&s.video_id.as_str()));
+        assert!(
+            found_any_known,
+            "Expected at least one known scheduled stream in web discovery: {:?}",
+            streams
+        );
+        assert!(
+            streams.iter().all(|s| s.status == "live" || s.status == "upcoming"),
+            "web discovery returned a non-stream entry: {:?}",
+            streams
+        );
     }
 
     #[test]
@@ -3645,5 +3680,26 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live check (not run in CI): a scheduled (upcoming) stream must be
+    /// reported as "upcoming" by the watch-page fallback — NOT rejected as
+    /// unplayable. Run with:
+    ///   cargo test --release live_watch_page_upcoming -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_watch_page_upcoming_reports_upcoming_not_unplayable() {
+        // PROJECT PITT — a scheduled stream on the configured channel.
+        let client = reqwest::Client::new();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let info = rt
+            .block_on(fetch_video_from_watch_page(&client, "hHyw0Rkp4SI"))
+            .expect("watch page must resolve");
+        let info = info.expect("a scheduled stream must not be rejected as unplayable");
+        assert_eq!(
+            info.status, "upcoming",
+            "LIVE_STREAM_OFFLINE must be treated as upcoming, got {:?}",
+            info.status
+        );
     }
 }
