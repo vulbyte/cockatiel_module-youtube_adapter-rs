@@ -27,6 +27,11 @@ type WsWriteHalf = futures_util::stream::SplitSink<
     WsMessage,
 >;
 
+/// A browser-like User-Agent used for keyless YouTube web endpoints (the watch
+/// page, InnerTube browse/live-chat), which reject default HTTP client agents.
+const YOUTUBE_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 /// The module's engine-session identity (auth token + assigned instance + name).
 /// Held in a shared Mutex so a reconnect can swap it in place and every other
 /// task (read loop, platform send path) always uses the CURRENT session's
@@ -315,6 +320,10 @@ struct StreamInfo {
     title: String,
     status: String, // "live" or "upcoming"
     published_at: String,
+    /// The stream's scheduled start time (ISO 8601) when known. Used to order
+    /// the selection prompt chronologically (soonest first). Falls back to
+    /// `published_at` when the start time isn't available.
+    scheduled_start: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1150,6 +1159,11 @@ async fn fetch_video_stream(
                         title,
                         status,
                         published_at,
+                        scheduled_start: details
+                            .and_then(|l| l.get("scheduledStartTime"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     });
                 }
             }
@@ -1272,7 +1286,15 @@ async fn fetch_video_from_watch_page(
             "upcoming"
         }
         .to_string(),
-        published_at,
+        published_at: published_at.clone(),
+        // The watch page may carry the scheduled start in liveBroadcastDetails;
+        // fall back to the publish date when it isn't present.
+        scheduled_start: vd
+            .get("liveBroadcastDetails")
+            .and_then(|b| b.get("scheduledStartTime"))
+            .and_then(|s| s.as_str())
+            .unwrap_or(&published_at)
+            .to_string(),
     }))
 }
 
@@ -1473,6 +1495,7 @@ fn extract_streams_from_json(val: &serde_json::Value, out: &mut Vec<StreamInfo>)
                                 title,
                                 status,
                                 published_at: "".to_string(),
+                                scheduled_start: "".to_string(),
                                     });
                         }
                     }
@@ -1506,6 +1529,7 @@ fn extract_streams_from_json(val: &serde_json::Value, out: &mut Vec<StreamInfo>)
                                 title,
                                 status,
                                 published_at: "".to_string(),
+                                scheduled_start: "".to_string(),
                                     });
                         }
                     }
@@ -1722,7 +1746,10 @@ async fn fetch_streams(
                                                         video_id: video_id.to_string(),
                                                         title,
                                                         status,
-                                                        published_at,
+                                                        published_at: published_at.clone(),
+                                                        // Search items carry no scheduledStartTime; the publish date is the
+                                                        // closest ordering signal and works for the chronological prompt.
+                                                        scheduled_start: published_at,
                                                                                     });
                                                 }
                                             }
@@ -1885,6 +1912,36 @@ async fn prompt_for_input(
 
 /// Prompts user to select a stream with a 30-second timeout fallback.
 /// Also provides guidance and input prompt for unlisted streams.
+/// Order streams chronologically for the selection prompt: live first, then
+/// upcoming sorted by scheduled start (soonest first), falling back to the
+/// publish date when the start time isn't known. ISO 8601 timestamps compare
+/// lexically, which is the same as chronologically.
+fn sort_streams_chronologically(streams: &[StreamInfo]) -> Vec<StreamInfo> {
+    let mut sorted: Vec<StreamInfo> = streams.to_vec();
+    sorted.sort_by(|a, b| {
+        let a_live = a.status == "live";
+        let b_live = b.status == "live";
+        match (a_live, b_live) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let a_start = if !a.scheduled_start.is_empty() {
+                    &a.scheduled_start
+                } else {
+                    &a.published_at
+                };
+                let b_start = if !b.scheduled_start.is_empty() {
+                    &b.scheduled_start
+                } else {
+                    &b.published_at
+                };
+                a_start.cmp(b_start)
+            }
+        }
+    });
+    sorted
+}
+
 async fn select_stream(
     streams: &[StreamInfo],
     client: &reqwest::Client,
@@ -1898,6 +1955,12 @@ async fn select_stream(
     instance_uuid: &str,
     prompt_timeout_secs: u32,
 ) -> Option<StreamInfo> {
+    // Order the selection prompt chronologically: the soonest scheduled stream
+    // first, the furthest-out last. Live streams sort ahead of upcoming (they
+    // are already broadcasting). The prompt and the auto-select fallback both
+    // read this sorted list, so the number the operator picks maps to the
+    // stream they expect.
+    let sorted = sort_streams_chronologically(streams);
     if streams.is_empty() {
         println!("\n==================================================");
         println!("        No Streams Currently Found                ");
@@ -1960,7 +2023,7 @@ async fn select_stream(
     println!("\n==================================================");
     println!("        Available YouTube Streams                 ");
     println!("==================================================");
-    for (i, stream) in streams.iter().enumerate() {
+    for (i, stream) in sorted.iter().enumerate() {
         let tag = if stream.status == "live" {
             "[LIVE]"
         } else {
@@ -1974,13 +2037,13 @@ async fn select_stream(
             stream.video_id
         );
     }
-    println!("\n    > Enter a stream number [1-{}].", streams.len());
+    println!("\n    > Enter a stream number [1-{}].", sorted.len());
     println!("    > Or enter 'u' to monitor an Unlisted Stream URL/Video ID.");
     println!("    > If no selection is made, the newest stream will be auto-selected.\n");
 
     // Ask the operator (via a Prompt) for a selection.
     let mut details = format!("Select a stream to monitor.\n\n");
-    for (i, stream) in streams.iter().enumerate() {
+    for (i, stream) in sorted.iter().enumerate() {
         details.push_str(&format!("{}: {} ({})\n", i + 1, stream.title, stream.video_id));
     }
     details.push_str("\nEnter a stream number, 'u' for an unlisted video, or leave empty to auto-select.");
@@ -2037,29 +2100,25 @@ async fn select_stream(
                 }
             }
         } else if let Ok(num) = user_input.parse::<usize>() {
-            if num > 0 && num <= streams.len() {
-                return Some(streams[num - 1].clone());
+            if num > 0 && num <= sorted.len() {
+                return Some(sorted[num - 1].clone());
             }
         }
     }
 
-    // Fallback: pick newest live stream, or newest upcoming if none are live
-    let mut live: Vec<&StreamInfo> = streams.iter().filter(|s| s.status == "live").collect();
-    if !live.is_empty() {
-        live.sort_by(|a, b| b.published_at.cmp(&a.published_at));
-        println!("    > Auto-selected live stream: {}", live[0].title);
-        return Some(live[0].clone());
+    // Fallback: pick the first live stream, or the soonest upcoming stream.
+    // `sorted` is already chronological (soonest first), so the first match is
+    // the right choice for both.
+    if let Some(live_stream) = sorted.iter().find(|s| s.status == "live") {
+        println!("    > Auto-selected live stream: {}", live_stream.title);
+        return Some(live_stream.clone());
+    }
+    if let Some(upcoming_stream) = sorted.iter().find(|s| s.status == "upcoming") {
+        println!("    > Auto-selected upcoming stream: {}", upcoming_stream.title);
+        return Some(upcoming_stream.clone());
     }
 
-    let mut upcoming: Vec<&StreamInfo> =
-        streams.iter().filter(|s| s.status == "upcoming").collect();
-    if !upcoming.is_empty() {
-        upcoming.sort_by(|a, b| b.published_at.cmp(&a.published_at));
-        println!("    > Auto-selected upcoming stream: {}", upcoming[0].title);
-        return Some(upcoming[0].clone());
-    }
-
-    Some(streams[0].clone())
+    sorted.first().cloned()
 }
 
 /// Polls live chat for the selected stream until it ends, with automatic key rotation on quota limits
@@ -2217,6 +2276,199 @@ async fn send_stream_start_log(
     }
 }
 
+/// Fetch the YouTube watch page for a video and return the InnerTube
+/// `reloadContinuationData` chat continuation token plus the visitor data,
+/// when the page exposes them. The reload token is what the InnerTube
+/// `get_live_chat` endpoint accepts for an UPCOMING stream's waiting-room chat
+/// (the Data API has no chat id until the stream goes live, but the waiting
+/// room chat IS live and keyless-accessible).
+async fn fetch_inner_chat_continuation(
+    client: &reqwest::Client,
+    video_id: &str,
+) -> Option<(String, String)> {
+    let url = format!("https://www.youtube.com/watch?v={}", video_id);
+    let html = client
+        .get(&url)
+        .header("User-Agent", YOUTUBE_UA)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let token = extract_after_marker(&html, "reloadContinuationData", "\"continuation\":\"")?;
+    let visitor = extract_after_marker(&html, "\"visitorData\"", "\"visitorData\":\"").unwrap_or_default();
+    Some((token, visitor))
+}
+
+/// A single chat message parsed from an InnerTube live-chat response.
+struct InnerChatMessage {
+    id: String,
+    author: String,
+    text: String,
+}
+
+/// Poll the InnerTube `get_live_chat` endpoint keylessly. Returns the messages
+/// plus the next continuation token (or None when the chat is done/closed).
+async fn poll_inner_chat(
+    client: &reqwest::Client,
+    token: &str,
+    visitor_data: &str,
+) -> (Vec<InnerChatMessage>, Option<String>) {
+    let body = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20240718.01.00",
+                "hl": "en",
+                "gl": "US",
+                "visitorData": visitor_data,
+            },
+        },
+        "continuation": token,
+    });
+    let mut messages = Vec::new();
+    let resp = client
+        .post("https://www.youtube.com/youtubei/v1/live_chat/get_live_chat")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", YOUTUBE_UA)
+        .json(&body)
+        .send()
+        .await;
+    let Ok(resp) = resp else { return (messages, None) };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return (messages, None);
+    };
+    let Some(lc) = json
+        .get("continuationContents")
+        .and_then(|c| c.get("liveChatContinuation"))
+    else {
+        return (messages, None);
+    };
+    if let Some(actions) = lc.get("actions").and_then(|a| a.as_array()) {
+        for action in actions {
+            let Some(item) = action.get("addChatItemAction").and_then(|a| a.get("item")) else {
+                continue;
+            };
+            let Some(r) = item.get("liveChatTextMessageRenderer") else {
+                continue;
+            };
+            let id = r
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
+            let author = r
+                .get("authorName")
+                .and_then(|a| a.get("simpleText"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let text = r
+                .get("message")
+                .and_then(|m| m.get("runs"))
+                .and_then(|runs| runs.as_array())
+                .map(|runs| {
+                    runs.iter()
+                        .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            if !text.is_empty() {
+                messages.push(InnerChatMessage { id, author, text });
+            }
+        }
+    }
+    let next = lc
+        .get("continuations")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("liveChatContinuationData"))
+        .and_then(|c| c.get("continuation"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
+    (messages, next)
+}
+
+/// Forward a batch of chat messages to the engine as `MessagePreProcess`
+/// payloads (platform "youtube"). Deduped against `seen_ids` so a retried poll
+/// of the same page never re-ingests. Reuses the same channel id as the live
+/// chat slot (falling back to the video id).
+async fn forward_inner_chat_messages(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    video_id: &str,
+    seen_ids: &mut SeenMessageIds,
+    messages: &[InnerChatMessage],
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    for m in messages {
+        if !m.id.is_empty() && seen_ids.is_seen(&m.id) {
+            continue;
+        }
+        info!("[YouTube Chat] {}: {}", m.author, m.text);
+        let pre_process = MessagePreProcess {
+            audio: vec![],
+            audio_type: String::new(),
+            message_uuid7: String::new(),
+            raw_message: Some(ChatMessage {
+                platform: "youtube".into(),
+                raw_data: Vec::new(),
+                raw_message: m.text.clone(),
+                user_uuid7: m.author.clone(),
+                command: None,
+                channel_id: video_id.to_string(),
+                user_data: None,
+            }),
+        };
+        let container = ContainerForEngine {
+            version: 2,
+            auth_token: auth.clone(),
+            module_name: module.clone(),
+            module_instance_uuid7: instance.clone(),
+            payload: Some(EnginePayload::MessagePreProcess(pre_process)),
+        };
+let mut buf = Vec::new();
+                                 if container.encode(&mut buf).is_ok() {
+                                     let mut w = write_ws.lock().await;
+                                     if let Err(e) = w.send(WsMessage::Binary(buf)).await {
+                                         error!("Failed to send to engine: {}", e);
+                                     }
+        }
+    }
+}
+
+/// Find `needle` after `after` (the first occurrence), then return the quoted
+/// string that follows it. `needle` must include the opening quote, e.g.
+/// `"continuation":"` — the value runs to the next unescaped quote. Used to
+/// pull the InnerTube chat continuation token and the visitor data out of the
+/// watch page. Manual string search — no regex dependency.
+fn extract_after_marker(html: &str, after: &str, needle: &str) -> Option<String> {
+    let base = html.find(after)? + after.len();
+    let from = &html[base..];
+    let needle_pos = from.find(needle)? + needle.len();
+    let rest = &from[needle_pos..];
+    // The value starts immediately after the needle's opening quote.
+    let mut end = 0;
+    while end < rest.len() {
+        if rest.as_bytes()[end] == b'"' {
+            break;
+        }
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(rest[..end].to_string())
+}
+
 /// Push this video's current viewer count to the engine via a `ChannelStats`
 /// payload. The engine stores it and serves it to other modules through the
 /// `channel_viewers` virtual query. Reads the session identity at send time.
@@ -2283,6 +2535,9 @@ async fn monitor_stream_chat(
     // Whether the "all API keys exhausted" acknowledgment prompt has been shown
     // this session. Shown once so the operator isn't spammed every backoff.
     let mut notified_exhausted = false;
+    // Dedup for the keyless waiting-room chat polled before the stream goes
+    // live (the reload token re-fetches the same early messages).
+    let mut waiting_seen = SeenMessageIds::new(tuning.dedup_cap);
     let chat_id = 'found_chat: loop {
         attempt += 1;
         if attempt > tuning.chat_open_max_attempts {
@@ -2409,13 +2664,14 @@ async fn monitor_stream_chat(
                     );
                 }
             } else {
-                // Upcoming — wait and retry. Surface the wait state to the
-                // operator (via the engine log) once so term-chat / the TUI
-                // shows what the adapter is doing instead of a silent void:
-                // the stream is scheduled, and chat will begin when it goes live.
+                // Upcoming — wait and retry. The waiting-room chat IS live on
+                // YouTube for a scheduled stream (viewers can post before it
+                // goes live), accessible keylessly via InnerTube. Poll it and
+                // forward messages to the engine so term-chat shows them, then
+                // keep checking for the real go-live above.
                 if attempt % 6 == 1 {
                     info!(
-                        "Stream '{}' is upcoming ({}). Waiting for it to go live...",
+                        "Stream '{}' is upcoming ({}). Polling the waiting-room chat...",
                         stream_info.title, stream_info.status
                     );
                     if attempt == 1 {
@@ -2423,12 +2679,30 @@ async fn monitor_stream_chat(
                             write_ws,
                             identity,
                             &format!(
-                                "[youtube] monitoring scheduled stream '{}' ({}) — chat will appear when it goes live",
+                                "[youtube] monitoring scheduled stream '{}' ({}) — waiting-room chat is live until the stream starts",
                                 stream_info.title, video_id
                             ),
                         )
                         .await;
                     }
+                }
+                // Keyless waiting-room chat: fetch the watch page's reload
+                // continuation token, poll InnerTube, forward messages.
+                if let Some((token, visitor)) =
+                    fetch_inner_chat_continuation(client, video_id).await
+                {
+                    let (msgs, _next) = poll_inner_chat(client, &token, &visitor).await;
+                    if !msgs.is_empty() {
+                        info!("Waiting-room chat returned {} message(s)", msgs.len());
+                    }
+                    forward_inner_chat_messages(
+                        write_ws,
+                        identity,
+                        video_id,
+                        &mut waiting_seen,
+                        &msgs,
+                    )
+                    .await;
                 }
             }
         }
@@ -3481,6 +3755,42 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_sort_is_chronological() {
+        let mk = |id: &str, status: &str, start: &str| StreamInfo {
+            video_id: id.into(),
+            title: format!("Stream {id}"),
+            status: status.into(),
+            published_at: start.into(),
+            scheduled_start: start.into(),
+        };
+        let streams = vec![
+            mk("far", "upcoming", "2026-10-05T18:00:00Z"),
+            mk("live1", "live", "2026-10-03T10:00:00Z"),
+            mk("soon", "upcoming", "2026-10-03T18:00:00Z"),
+            mk("mid", "upcoming", "2026-10-04T12:00:00Z"),
+        ];
+        let sorted = sort_streams_chronologically(&streams);
+        let order: Vec<&str> = sorted.iter().map(|s| s.video_id.as_str()).collect();
+        // Live first, then upcoming soonest → furthest.
+        assert_eq!(order, vec!["live1", "soon", "mid", "far"], "chronological order");
+    }
+
+    #[test]
+    fn test_stream_sort_falls_back_to_publish_date() {
+        let mk = |id: &str, start: &str| StreamInfo {
+            video_id: id.into(),
+            title: format!("Stream {id}"),
+            status: "upcoming".into(),
+            published_at: start.into(),
+            scheduled_start: String::new(),
+        };
+        let streams = vec![mk("later", "2026-10-06T00:00:00Z"), mk("earlier", "2026-10-02T00:00:00Z")];
+        let sorted = sort_streams_chronologically(&streams);
+        assert_eq!(sorted[0].video_id, "earlier", "falls back to publish date");
+        assert_eq!(sorted[1].video_id, "later");
+    }
+
+    #[test]
     fn test_format_utc_iso() {
         assert_eq!(format_utc_iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_utc_iso(86_400), "1970-01-02T00:00:00Z");
@@ -3784,5 +4094,31 @@ mod tests {
             "LIVE_STREAM_OFFLINE must be treated as upcoming, got {:?}",
             info.status
         );
+    }
+
+    /// Live check (not run in CI): an upcoming stream's waiting-room chat is
+    /// keyless-accessible via the InnerTube reload token, and returns real
+    /// messages. Run with:
+    ///   cargo test --release live_inner_chat_waiting_room -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_inner_chat_waiting_room_returns_messages() {
+        let client = reqwest::Client::new();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (token, visitor) = rt
+            .block_on(fetch_inner_chat_continuation(&client, "hHyw0Rkp4SI"))
+            .expect("must extract the reload continuation token");
+        assert!(!token.is_empty(), "reload token must not be empty");
+        assert!(!visitor.is_empty(), "visitor data must not be empty");
+        let (msgs, _next) = rt.block_on(poll_inner_chat(&client, &token, &visitor));
+        // The scheduled stream's waiting-room chat should return messages (the
+        // operator posts in it before the stream goes live).
+        assert!(
+            !msgs.is_empty(),
+            "expected waiting-room chat messages, got none"
+        );
+        let sample = &msgs[0];
+        assert!(!sample.text.is_empty(), "message text must not be empty");
+        eprintln!("first waiting-room message: {}: {}", sample.author, sample.text);
     }
 }
