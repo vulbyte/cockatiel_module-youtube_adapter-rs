@@ -141,6 +141,8 @@ struct YoutubeAdapterConfig {
     stream_scan_interval_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::prompt_timeout_secs")]
     prompt_timeout_secs: u32,
+    #[serde(default = "YoutubeAdapterConfig::stream_control_poll_secs")]
+    stream_control_poll_secs: u32,
 }
 
 impl YoutubeAdapterConfig {
@@ -201,6 +203,9 @@ impl YoutubeAdapterConfig {
     fn prompt_timeout_secs() -> u32 {
         300
     }
+    fn stream_control_poll_secs() -> u32 {
+        10
+    }
 }
 
 impl Default for YoutubeAdapterConfig {
@@ -232,6 +237,7 @@ impl Default for YoutubeAdapterConfig {
             stream_fetch_retry_secs: Self::stream_fetch_retry_secs(),
             stream_scan_interval_secs: Self::stream_scan_interval_secs(),
             prompt_timeout_secs: Self::prompt_timeout_secs(),
+            stream_control_poll_secs: Self::stream_control_poll_secs(),
         }
     }
 }
@@ -260,6 +266,7 @@ struct Tuning {
     stream_fetch_retry_secs: u32,
     stream_scan_interval_secs: u32,
     prompt_timeout_secs: u32,
+    stream_control_poll_secs: u32,
 }
 
 impl Default for Tuning {
@@ -284,6 +291,7 @@ impl Default for Tuning {
             stream_fetch_retry_secs: YoutubeAdapterConfig::stream_fetch_retry_secs(),
             stream_scan_interval_secs: YoutubeAdapterConfig::stream_scan_interval_secs(),
             prompt_timeout_secs: YoutubeAdapterConfig::prompt_timeout_secs(),
+            stream_control_poll_secs: YoutubeAdapterConfig::stream_control_poll_secs(),
         }
     }
 }
@@ -310,6 +318,7 @@ impl From<&YoutubeAdapterConfig> for Tuning {
             stream_fetch_retry_secs: cfg.stream_fetch_retry_secs,
             stream_scan_interval_secs: cfg.stream_scan_interval_secs,
             prompt_timeout_secs: cfg.prompt_timeout_secs,
+            stream_control_poll_secs: cfg.stream_control_poll_secs,
         }
     }
 }
@@ -2179,6 +2188,143 @@ async fn send_to_youtube(
     }
 }
 
+/// The MIME type to declare for a thumbnail file, from its extension. YouTube
+/// accepts PNG and JPEG; anything else is declared JPEG and the API rejects it
+/// with a clear error.
+fn thumbnail_mime(path: &str) -> &'static str {
+    if path.to_lowercase().ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Merge the desired title / scheduled start into a video snippet, preserving
+/// the fields the Data API requires (notably `categoryId`) and everything else
+/// the caller did not set. Pure so the `videos.update` body is testable.
+fn merge_video_snippet(
+    snippet: &serde_json::Value,
+    title: &str,
+    scheduled_start_ms: i64,
+) -> serde_json::Value {
+    let mut merged = snippet.clone();
+    if !title.is_empty() {
+        merged["title"] = json!(title);
+    }
+    if scheduled_start_ms != 0 {
+        // YouTube wants RFC3339 (UTC): epoch ms -> whole seconds.
+        merged["scheduledStartTime"] =
+            json!(format_utc_iso((scheduled_start_ms / 1000).max(0) as u64));
+    }
+    merged
+}
+
+/// Apply the stream control to `video_id` via the YouTube Data API:
+/// `videos.update` for the title / scheduled start (read-modify-write, because
+/// `videos.update` REPLACES the snippet), and `thumbnails.set` for the
+/// thumbnail (the local file is uploaded by this service). Returns a short
+/// human summary of what was applied.
+async fn apply_youtube_stream_control(
+    oauth: &OAuthManager,
+    client: &reqwest::Client,
+    video_id: &str,
+    control: &serde_json::Value,
+) -> Result<String, String> {
+    if video_id.is_empty() {
+        return Err("no active YouTube video to apply the stream control to".to_string());
+    }
+    let title = control.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let scheduled_start_ms = control
+        .get("scheduled_start_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let thumbnail = control
+        .get("thumbnail_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let access = oauth.ensure_access_token(client).await?;
+    let mut applied: Vec<String> = Vec::new();
+
+    if !title.is_empty() || scheduled_start_ms != 0 {
+        // Read the current snippet first: `videos.update` replaces the whole
+        // snippet, so the required `categoryId` (and anything else) must be
+        // carried over or the API rejects the update.
+        let get = client
+            .get("https://www.googleapis.com/youtube/v3/videos")
+            .query(&[("part", "snippet"), ("id", video_id)])
+            .bearer_auth(&access)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("videos.list failed: {e}"))?;
+        let status = get.status();
+        let body: serde_json::Value = get
+            .json()
+            .await
+            .map_err(|e| format!("videos.list parse failed ({status}): {e}"))?;
+        if !status.is_success() {
+            return Err(format!("videos.list {status}: {body}"));
+        }
+        let snippet = body
+            .get("items")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.get("snippet"))
+            .cloned()
+            .ok_or_else(|| format!("video {video_id} has no snippet to update"))?;
+        let merged = merge_video_snippet(&snippet, title, scheduled_start_ms);
+        let put = client
+            .put("https://www.googleapis.com/youtube/v3/videos")
+            .query(&[("part", "snippet")])
+            .bearer_auth(&access)
+            .json(&json!({ "id": video_id, "snippet": merged }))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("videos.update failed: {e}"))?;
+        if !put.status().is_success() {
+            let s = put.status();
+            let text = put.text().await.unwrap_or_default();
+            return Err(format!("videos.update {s}: {text}"));
+        }
+        let mut what = Vec::new();
+        if !title.is_empty() {
+            what.push("title");
+        }
+        if scheduled_start_ms != 0 {
+            what.push("start");
+        }
+        applied.push(format!("set {}", what.join("+")));
+    }
+
+    if !thumbnail.is_empty() {
+        let bytes = std::fs::read(thumbnail)
+            .map_err(|e| format!("thumbnail '{thumbnail}' unreadable: {e}"))?;
+        let set = client
+            .post("https://www.googleapis.com/upload/youtube/v3/thumbnails/set")
+            .query(&[("videoId", video_id)])
+            .bearer_auth(&access)
+            .header("Content-Type", thumbnail_mime(thumbnail))
+            .body(bytes)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("thumbnails.set failed: {e}"))?;
+        if !set.status().is_success() {
+            let s = set.status();
+            let text = set.text().await.unwrap_or_default();
+            return Err(format!("thumbnails.set {s}: {text}"));
+        }
+        applied.push("thumbnail".to_string());
+    }
+
+    if applied.is_empty() {
+        Ok("nothing to apply".to_string())
+    } else {
+        Ok(applied.join("; "))
+    }
+}
+
 /// Bounded set of recently-ingested live-chat message ids. Guards against
 /// re-ingesting the same messages when a poll request times out AFTER the
 /// server already processed it — the retry re-fetches the same page with the
@@ -3075,6 +3221,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let send_tx_task = send_tx;
 
+    // Stream-manager wiring: the video the adapter is currently targeting (set
+    // by the discovery loop below), and a channel the read loop forwards
+    // `stream_schedule` poll results into. The stream-control task (spawned
+    // after the read loop) awaits them, applies the control via the Data API and
+    // reports the result back.
+    let current_video: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (schedule_tx, mut schedule_rx) = mpsc::channel::<serde_json::Value>(8);
+
     // Channel carrying PromptResponses from the engine to the stream loop,
     // so `prompt_for_input` can await the operator's typed answer.
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
@@ -3098,13 +3252,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let id = identity_task.lock().await;
                             (id.auth.clone(), id.instance.clone(), id.module.clone())
                         };
-                        info!(
-                            "Received from engine: {:?}",
-                            container
-                                .payload
-                                .as_ref()
-                                .map(|p| std::mem::discriminant(p))
-                        );
 
                         // Answer the engine's liveness probe with our auth token
                         // so a quiet period never severs us.
@@ -3221,6 +3368,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = w.send(WsMessage::Binary(rbuf)).await;
                                 }
                             }
+                        } else if let Some(ModulePayload::DatabaseQueryResult(res)) = container.payload {
+                            // A `stream_schedule` poll result: forward it to the
+                            // stream-control task, which owns the apply logic.
+                            if res.query_id == "stream_schedule" {
+                                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&res.result_blob) {
+                                    let _ = schedule_tx.try_send(v);
+                                }
+                            }
                         }
                     }
                 }
@@ -3266,6 +3421,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // ── Stream-control poll task ─────────────────────────────────────────
+    // Every `stream_control_poll_secs`, read the engine's desired control
+    // (`stream_schedule`) and, when the revision changed, apply it to the
+    // current video via the Data API and report the result back
+    // (`stream_control_status`). The read loop forwards the schedule results on
+    // `schedule_rx`; this task owns the apply logic so a slow API call never
+    // delays the read loop's AuthVerify replies.
+    {
+        let oauth = oauth.clone();
+        let client = client.clone();
+        let write = write_ws_cockatiel.clone();
+        let identity = identity.clone();
+        let current_video = Arc::clone(&current_video);
+        let poll_secs = tuning.stream_control_poll_secs.max(5);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(poll_secs as u64));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_applied = 0u64;
+            loop {
+                tick.tick().await;
+                let (auth, instance, module) = {
+                    let id = identity.lock().await;
+                    (id.auth.clone(), id.instance.clone(), id.module.clone())
+                };
+                // Ask the engine for the current schedule.
+                let query = ContainerForEngine {
+                    version: 2,
+                    auth_token: auth.clone(),
+                    module_name: module.clone(),
+                    module_instance_uuid7: instance.clone(),
+                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                        query_id: "stream_schedule".to_string(),
+                        sql: "{}".to_string(),
+                        params: vec![],
+                    })),
+                };
+                let mut qbuf = Vec::new();
+                if query.encode(&mut qbuf).is_err() {
+                    continue;
+                }
+                {
+                    let mut w = write.lock().await;
+                    if w.send(WsMessage::Binary(qbuf.into())).await.is_err() {
+                        continue;
+                    }
+                }
+                // The read loop forwards the answer here.
+                let control = match tokio::time::timeout(Duration::from_secs(10), schedule_rx.recv()).await {
+                    Ok(Some(v)) => v,
+                    _ => continue,
+                };
+                let revision = control.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+                if revision == 0 || revision == last_applied {
+                    continue;
+                }
+                let video_id = current_video.lock().unwrap().clone().unwrap_or_default();
+                let (ok, message) = match apply_youtube_stream_control(&oauth, &client, &video_id, &control).await {
+                    Ok(m) => (true, m),
+                    Err(e) => (false, e),
+                };
+                last_applied = revision;
+                info!("[stream-control] rev {} applied={} — {}", revision, ok, message);
+                let status = json!({
+                    "platform": "youtube",
+                    "revision": revision,
+                    "ok": ok,
+                    "message": message,
+                });
+                let report = ContainerForEngine {
+                    version: 2,
+                    auth_token: auth,
+                    module_name: module,
+                    module_instance_uuid7: instance,
+                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                        query_id: "stream_control_status".to_string(),
+                        sql: status.to_string(),
+                        params: vec![],
+                    })),
+                };
+                let mut rbuf = Vec::new();
+                if report.encode(&mut rbuf).is_ok() {
+                    let mut w = write.lock().await;
+                    let _ = w.send(WsMessage::Binary(rbuf.into())).await;
+                }
+            }
+        });
+    }
 
     // ── Linear setup phase ───────────────────────────────────────────────
     // Resolve auth + API keys, validate the target (channel/video) with an
@@ -3712,6 +3955,10 @@ loop {
         chosen_stream.title, chosen_stream.video_id
     );
 
+    // Publish the target video so the stream-control task applies the operator's
+    // title / start / thumbnail to it while it is selected (live or upcoming).
+    *current_video.lock().unwrap() = Some(chosen_stream.video_id.clone());
+
     // Monitor stream live chat until the stream ends
     monitor_stream_chat(
         &write_ws_cockatiel,
@@ -3728,6 +3975,7 @@ loop {
     )
     .await;
 
+    *current_video.lock().unwrap() = None;
     info!("Stream finished. Restarting discovery loop for seamless transition...");
     }
 }
@@ -3841,6 +4089,37 @@ mod tests {
         assert_eq!(format_utc_iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_utc_iso(86_400), "1970-01-02T00:00:00Z");
         assert_eq!(format_utc_iso(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_merge_video_snippet_preserves_required_fields() {
+        let snippet = json!({
+            "title": "Old",
+            "categoryId": "20",
+            "description": "keep me",
+            "scheduledStartTime": "2026-01-01T00:00:00Z",
+        });
+        let merged = merge_video_snippet(&snippet, "New Title", 0);
+        assert_eq!(merged["title"], "New Title");
+        // `categoryId` is REQUIRED by videos.update and must survive.
+        assert_eq!(merged["categoryId"], "20");
+        assert_eq!(merged["description"], "keep me");
+        // scheduled_start_ms == 0 leaves the existing schedule untouched.
+        assert_eq!(merged["scheduledStartTime"], "2026-01-01T00:00:00Z");
+
+        // A non-zero start overwrites scheduledStartTime (RFC3339, UTC).
+        let merged = merge_video_snippet(&snippet, "", 1_704_067_200_000);
+        assert_eq!(merged["title"], "Old", "empty title leaves it unchanged");
+        assert_eq!(merged["scheduledStartTime"], "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_thumbnail_mime() {
+        assert_eq!(thumbnail_mime("/x/y.PNG"), "image/png");
+        assert_eq!(thumbnail_mime("/x/y.png"), "image/png");
+        assert_eq!(thumbnail_mime("/x/y.jpg"), "image/jpeg");
+        assert_eq!(thumbnail_mime("/x/y.jpeg"), "image/jpeg");
+        assert_eq!(thumbnail_mime("/x/y"), "image/jpeg");
     }
 
     #[test]
