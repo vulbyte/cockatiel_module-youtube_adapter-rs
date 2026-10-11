@@ -407,21 +407,97 @@ impl ApiKeyManager {
         }
         false
     }
+
+    fn is_key_error(json: &serde_json::Value) -> bool {
+        const NON_KEY_REASONS: [&str; 5] = [
+            "livechatended",
+            "livechatdisabled",
+            "livechatnotfound",
+            "videonotfound",
+            "livestreamingnotenabled",
+        ];
+        const KEY_REASONS: [&str; 10] = [
+            "quotaexceeded",
+            "ratelimitexceeded",
+            "dailylimitexceeded",
+            "userratelimitexceeded",
+            "keyinvalid",
+            "api_key_invalid",
+            "accessnotconfigured",
+            "iprefererblocked",
+            "forbidden",
+            "permission_denied",
+        ];
+        if let Some(err) = json.get("error") {
+            if let Some(errors) = err.get("errors").and_then(|e| e.as_array()) {
+                for e in errors {
+                    let reason = e
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if NON_KEY_REASONS.contains(&reason.as_str()) {
+                        return false;
+                    }
+                    let domain = e.get("domain").and_then(|d| d.as_str()).unwrap_or("");
+                    if domain == "youtube.quota" || domain == "usageLimits" {
+                        return true;
+                    }
+                    if KEY_REASONS.contains(&reason.as_str()) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(status) = err.get("status").and_then(|s| s.as_str()) {
+                if KEY_REASONS.contains(&status.to_lowercase().as_str()) {
+                    return true;
+                }
+            }
+        }
+        Self::is_quota_error(json)
+    }
 }
 
-/// Tests whether the current YouTube API key is valid by making a lightweight Search API request.
+/// Rebuilds the key ring after a failed startup validation: drops the offending
+/// key (and any duplicate of the replacement), then prepends the new key so
+/// rotation keeps working over the remaining keys. An empty `new` is a no-op.
+fn replace_current_key(existing: &[String], current: &str, new: &str) -> Vec<String> {
+    let trimmed = new.trim();
+    if trimmed.is_empty() {
+        return existing.to_vec();
+    }
+    let mut out: Vec<String> = existing
+        .iter()
+        .filter(|k| k.as_str() != current && k.as_str() != trimmed)
+        .cloned()
+        .collect();
+    out.insert(0, trimmed.to_string());
+    out
+}
+
+/// Extracts a rotated refresh token from a token response when Google returns a
+/// new, non-empty one that differs from the token we sent.
+fn rotated_refresh_token(resp: &serde_json::Value, current: &str) -> Option<String> {
+    resp.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != current)
+        .map(|s| s.to_string())
+}
+
+/// Tests whether the current YouTube API key is valid by making a lightweight videos.list request (1 quota unit).
 async fn is_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> bool {
     let api_key = keys.current_key();
     if api_key.is_empty() {
         return false;
     }
     let url = format!(
-        "https://www.googleapis.com/youtube/v3/search?part=snippet&q=cockatiel&type=video&maxResults=1&key={}",
+        "https://www.googleapis.com/youtube/v3/videos?part=id&id=dQw4w9WgXcQ&key={}",
         api_key
     );
     match client.get(&url).send().await {
         Ok(res) => match res.json::<serde_json::Value>().await {
-            Ok(json) => !json.get("error").is_some(),
+            Ok(json) => json.get("error").is_none(),
             Err(_) => false,
         },
         Err(_) => false,
@@ -990,11 +1066,27 @@ impl OAuthManager {
             .await
             .map_err(|e| format!("token refresh parse failed: {}", e))?;
 
+        if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
+            if err == "invalid_grant" {
+                *self.access_token.lock().unwrap() = None;
+                *self.refresh_token.lock().unwrap() = None;
+                return Err(
+                    "Google OAuth refresh token is invalid or revoked (invalid_grant); re-authorize the module".to_string(),
+                );
+            }
+        }
+
         let access = resp
             .get("access_token")
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("no access_token in refresh response: {:?}", resp))?
             .to_string();
+
+        if let Some(rotated) = rotated_refresh_token(&resp, &refresh) {
+            self.set_refresh_token(&rotated);
+            save_oauth_refresh_token(&rotated);
+            info!("Google OAuth refresh token rotated and persisted.");
+        }
         let expires_in = resp
             .get("expires_in")
             .and_then(|v| v.as_i64())
@@ -1108,7 +1200,7 @@ async fn fetch_video_stream(
         let res = client.get(&url).send().await?;
         let json = res.json::<serde_json::Value>().await?;
 
-        if ApiKeyManager::is_quota_error(&json) {
+        if ApiKeyManager::is_key_error(&json) {
             warn!(
                 "YouTube API quota exceeded for key {} while fetching video {}.",
                 attempt + 1,
@@ -1352,7 +1444,7 @@ async fn get_channel_id(
 
         if let Ok(res) = client.get(&url_with_at).send().await {
             if let Ok(json) = res.json::<serde_json::Value>().await {
-                if ApiKeyManager::is_quota_error(&json) {
+                if ApiKeyManager::is_key_error(&json) {
                     warn!("API key quota exceeded resolving handle with @. Rotating key...");
                     keys.rotate_to_next();
                     continue;
@@ -1375,7 +1467,7 @@ async fn get_channel_id(
         );
         if let Ok(res) = client.get(&url_without_at).send().await {
             if let Ok(json) = res.json::<serde_json::Value>().await {
-                if ApiKeyManager::is_quota_error(&json) {
+                if ApiKeyManager::is_key_error(&json) {
                     warn!("API key quota exceeded resolving handle without @. Rotating key...");
                     keys.rotate_to_next();
                     continue;
@@ -1398,7 +1490,7 @@ async fn get_channel_id(
         );
         if let Ok(res) = client.get(&url_username).send().await {
             if let Ok(json) = res.json::<serde_json::Value>().await {
-                if ApiKeyManager::is_quota_error(&json) {
+                if ApiKeyManager::is_key_error(&json) {
                     warn!("API key quota exceeded resolving legacy username. Rotating key...");
                     keys.rotate_to_next();
                     continue;
@@ -1710,7 +1802,7 @@ async fn fetch_streams(
                 match client.get(&url).send().await {
                     Ok(res) => {
                         if let Ok(json) = res.json::<serde_json::Value>().await {
-                            if ApiKeyManager::is_quota_error(&json) {
+                            if ApiKeyManager::is_key_error(&json) {
                                 warn!(
                                     "YouTube Search API quota exceeded for eventType={}. Rotating API key...",
                                     event_type
@@ -2721,7 +2813,7 @@ async fn monitor_stream_chat(
         match client.get(&video_url).send().await {
             Ok(res) => {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
-                    if ApiKeyManager::is_quota_error(&json) {
+                    if ApiKeyManager::is_key_error(&json) {
                         // The current key is exhausted: rotate to the next one so
                         // a healthy key can resolve the stream's activeLiveChatId.
                         // Without this the adapter sticks on the first (exhausted)
@@ -2915,40 +3007,52 @@ async fn monitor_stream_chat(
                 let status = res.status();
 
                 if let Ok(json) = res.json::<serde_json::Value>().await {
-                    if ApiKeyManager::is_quota_error(&json) {
-                        quota_failures += 1;
-                        let key_count = keys.key_count().max(1) as u32;
-                        warn!(
-                            "API key quota exceeded while polling live chat messages (failure {}/{}) — rotating API key...",
-                            quota_failures, key_count
-                        );
-                        keys.rotate_to_next();
-                        // Full ring rotated with no success: back off instead of
-                        // spinning every 500ms against a quota-exhausted API.
-                        let delay = if quota_failures >= key_count {
-                            info!("All configured API keys are quota-exhausted; backing off {}s before polling again.", tuning.quota_backoff_secs);
-                            // Surface it to the operator ONCE per session: a
-                            // Boolean prompt they must acknowledge so they know
-                            // chat monitoring is paused on API limits (the keys
-                            // will recover on their own when quota resets).
-                            notify_all_keys_exhausted(
-                                write_ws,
-                                prompt_rx,
-                                auth_token,
-                                module_name,
-                                instance_uuid,
-                                tuning.prompt_timeout_secs,
-                                &mut notified_exhausted,
-                            )
-                            .await;
-                            std::time::Duration::from_secs(tuning.quota_backoff_secs as u64)
+                    if ApiKeyManager::is_key_error(&json) {
+                        if ApiKeyManager::is_quota_error(&json) {
+                            quota_failures += 1;
+                            let key_count = keys.key_count().max(1) as u32;
+                            warn!(
+                                "API key quota exceeded while polling live chat messages (failure {}/{}) — rotating API key...",
+                                quota_failures, key_count
+                            );
+                            keys.rotate_to_next();
+                            // Full ring rotated with no success: back off instead of
+                            // spinning every 500ms against a quota-exhausted API.
+                            let delay = if quota_failures >= key_count {
+                                info!("All configured API keys are quota-exhausted; backing off {}s before polling again.", tuning.quota_backoff_secs);
+                                // Surface it to the operator ONCE per session: a
+                                // Boolean prompt they must acknowledge so they know
+                                // chat monitoring is paused on API limits (the keys
+                                // will recover on their own when quota resets).
+                                notify_all_keys_exhausted(
+                                    write_ws,
+                                    prompt_rx,
+                                    auth_token,
+                                    module_name,
+                                    instance_uuid,
+                                    tuning.prompt_timeout_secs,
+                                    &mut notified_exhausted,
+                                )
+                                .await;
+                                std::time::Duration::from_secs(tuning.quota_backoff_secs as u64)
+                            } else {
+                                std::time::Duration::from_millis(tuning.poll_retry_delay_ms as u64)
+                            };
+                            tokio::time::sleep(delay).await;
                         } else {
-                            std::time::Duration::from_millis(tuning.poll_retry_delay_ms as u64)
-                        };
-                        tokio::time::sleep(delay).await;
+                            // Invalid/disabled/blocked key (not quota): rotate and
+                            // retry shortly without counting toward the quota backoff.
+                            quota_failures = 0;
+                            warn!("YouTube API key is invalid or disabled while polling live chat — rotating API key...");
+                            keys.rotate_to_next();
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                tuning.poll_retry_delay_ms as u64,
+                            ))
+                            .await;
+                        }
                         continue;
                     }
-                    // A non-quota response means at least one key is healthy.
+                    // A non-key-error response means at least one key is healthy.
                     quota_failures = 0;
 
                     if status == reqwest::StatusCode::NOT_FOUND {
@@ -3687,7 +3791,8 @@ if !is_api_key_valid(&client, &key_manager).await {
     if let Some(key) = new_key {
         let trimmed = key.trim().to_string();
         if !trimmed.is_empty() {
-            api_keys = vec![trimmed];
+            let offending = key_manager.current_key();
+            api_keys = replace_current_key(&api_keys, &offending, &trimmed);
             key_manager = ApiKeyManager::new(api_keys.clone());
             save_adapter_config(&channel_input, &api_keys, &unlisted_ids, "", "", "");
             info!("YouTube API key updated and saved to config.json");
@@ -4220,6 +4325,60 @@ mod tests {
             }
         });
         assert!(!ApiKeyManager::is_quota_error(&other_err));
+    }
+
+    #[test]
+    fn test_replace_current_key_preserves_ring() {
+        let existing = vec!["BAD".to_string(), "B".to_string(), "C".to_string()];
+        assert_eq!(
+            replace_current_key(&existing, "BAD", "NEW"),
+            vec!["NEW", "B", "C"]
+        );
+        // Empty replacement is a no-op (keeps the whole ring untouched).
+        assert_eq!(replace_current_key(&existing, "BAD", "   "), existing);
+        // A replacement already present elsewhere is de-duplicated.
+        assert_eq!(replace_current_key(&existing, "BAD", "B"), vec!["B", "C"]);
+    }
+
+    #[test]
+    fn test_is_key_error() {
+        let key_err = |reason: &str| {
+            json!({
+                "error": {
+                    "code": 400,
+                    "errors": [{ "reason": reason, "message": "x" }],
+                    "message": "x"
+                }
+            })
+        };
+        assert!(ApiKeyManager::is_key_error(&key_err("keyInvalid")));
+        assert!(ApiKeyManager::is_key_error(&key_err("API_KEY_INVALID")));
+        assert!(ApiKeyManager::is_key_error(&key_err("accessNotConfigured")));
+        assert!(ApiKeyManager::is_key_error(&key_err("ipRefererBlocked")));
+        assert!(ApiKeyManager::is_key_error(&key_err("quotaExceeded")));
+        // Non-key 403 reasons must not trigger a pointless rotation.
+        assert!(!ApiKeyManager::is_key_error(&key_err("liveChatEnded")));
+        assert!(!ApiKeyManager::is_key_error(&key_err("liveChatDisabled")));
+        assert!(!ApiKeyManager::is_key_error(&key_err("liveChatNotFound")));
+    }
+
+    #[test]
+    fn test_rotated_refresh_token() {
+        let resp = json!({ "access_token": "at", "refresh_token": "NEW_REFRESH" });
+        assert_eq!(
+            rotated_refresh_token(&resp, "OLD"),
+            Some("NEW_REFRESH".to_string())
+        );
+        // Same as current, absent, or blank => no rotation.
+        assert_eq!(rotated_refresh_token(&resp, "NEW_REFRESH"), None);
+        assert_eq!(
+            rotated_refresh_token(&json!({ "access_token": "at" }), "OLD"),
+            None
+        );
+        assert_eq!(
+            rotated_refresh_token(&json!({ "refresh_token": "   " }), "OLD"),
+            None
+        );
     }
 
     #[test]
