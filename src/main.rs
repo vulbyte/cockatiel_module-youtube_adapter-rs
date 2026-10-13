@@ -27,11 +27,6 @@ type WsWriteHalf = futures_util::stream::SplitSink<
     WsMessage,
 >;
 
-/// A browser-like User-Agent used for keyless YouTube web endpoints (the watch
-/// page, InnerTube browse/live-chat), which reject default HTTP client agents.
-const YOUTUBE_UA: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
 /// The module's engine-session identity (auth token + assigned instance + name).
 /// Held in a shared Mutex so a reconnect can swap it in place and every other
 /// task (read loop, platform send path) always uses the CURRENT session's
@@ -1270,131 +1265,7 @@ async fn fetch_video_stream(
         break;
     }
 
-    // Keyless fallback: scrape the watch page. Works without a valid Data API
-    // key and for Unlisted streams (Private/Draft remain unavailable even here).
-    if found.is_none() {
-        warn!(
-            "Data API lookup for {} failed (invalid/quota key?) — trying keyless watch-page scrape.",
-            video_id
-        );
-        found = fetch_video_from_watch_page(client, video_id).await?;
-    }
-
     Ok(found)
-}
-
-/// Keyless fallback: parse the watch page's `ytInitialPlayerResponse` for the
-/// video's title + live/upcoming status. No Data API key required.
-async fn fetch_video_from_watch_page(
-    client: &reqwest::Client,
-    video_id: &str,
-) -> Result<Option<StreamInfo>, Box<dyn std::error::Error>> {
-    let url = format!("https://www.youtube.com/watch?v={}", video_id);
-    let res = client
-        .get(&url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        .send()
-        .await?;
-    let html = res.text().await?;
-
-    let marker = "var ytInitialPlayerResponse = ";
-    let Some(start) = html.find(marker) else {
-        info!(
-            "Watch page for {} has no ytInitialPlayerResponse (private/unavailable?).",
-            video_id
-        );
-        return Ok(None);
-    };
-    // Parse just the first JSON value after the marker; the page appends more
-    // JS (`;var meta = ...`), so a plain from_str would fail on the trailing data.
-    let json_str = &html[start + marker.len()..];
-    let mut de = serde_json::Deserializer::from_str(json_str);
-    let data: serde_json::Value = match serde_json::Value::deserialize(&mut de) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("ytInitialPlayerResponse parse failed for {}: {}", video_id, e);
-            return Ok(None);
-        }
-    };
-
-    if let Some(status) = data
-        .get("playabilityStatus")
-        .and_then(|p| p.get("status"))
-        .and_then(|s| s.as_str())
-    {
-        // LIVE_STREAM_OFFLINE is the playability status a SCHEDULED / upcoming
-        // live stream reports until it actually starts broadcasting. It is NOT
-        // an error: the adapter must keep waiting for the stream to go live.
-        // Treat it as playable so the isLive/isUpcoming detection below runs
-        // and the monitor loop enters its "waiting for go-live" retry instead
-        // of silently giving up on a stream that simply hasn't started.
-        let is_scheduled_offline = status == "LIVE_STREAM_OFFLINE";
-        if status != "OK" && !is_scheduled_offline {
-            info!(
-                "Video {} is not playable (status={}); not a public/unlisted stream.",
-                video_id, status
-            );
-            return Ok(None);
-        }
-    }
-
-    let Some(vd) = data.get("videoDetails") else {
-        return Ok(None);
-    };
-    let title = vd
-        .get("title")
-        .and_then(|t| t.as_str())
-        .unwrap_or("Untitled Stream")
-        .to_string();
-    let is_live = vd.get("isLive").and_then(|v| v.as_bool()).unwrap_or(false);
-    let has_live_details = vd.get("liveBroadcastDetails").is_some();
-    // YouTube sets BOTH isLive and isUpcoming on a scheduled stream that has
-    // not started broadcasting yet (isLive merely means "it is a live event",
-    // not "it is on air"). isUpcoming is the authoritative "scheduled, waiting
-    // to go live" flag, so it must win over the isLive quirk — otherwise a
-    // scheduled stream is misreported as live and the monitor stops waiting.
-    let is_upcoming = vd
-        .get("isUpcoming")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || (has_live_details && !is_live);
-    let published_at = vd
-        .get("publishDate")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if !is_live && !is_upcoming {
-        info!("Video {} is a regular VOD, not a live/upcoming stream.", video_id);
-        return Ok(None);
-    }
-
-    Ok(Some(StreamInfo {
-        video_id: video_id.to_string(),
-        title,
-        // isUpcoming wins: a scheduled stream is "upcoming" until it actually
-        // broadcasts, even though the page also sets isLive on it.
-        status: if is_upcoming {
-            "upcoming"
-        } else if is_live {
-            "live"
-        } else {
-            "upcoming"
-        }
-        .to_string(),
-        published_at: published_at.clone(),
-        // The watch page may carry the scheduled start in liveBroadcastDetails;
-        // fall back to the publish date when it isn't present.
-        scheduled_start: vd
-            .get("liveBroadcastDetails")
-            .and_then(|b| b.get("scheduledStartTime"))
-            .and_then(|s| s.as_str())
-            .unwrap_or(&published_at)
-            .to_string(),
-    }))
 }
 
 /// Resolves a handle (e.g., @vulbyte or vulbyte), channel URL, or channel ID into an exact YouTube Channel ID (UC...)
@@ -1506,259 +1377,10 @@ async fn get_channel_id(
         break;
     }
 
-    // 4. Fallback: Fetch public channel page and extract channel ID directly from HTML metadata
-    info!(
-        "Attempting web fallback to resolve Channel ID for '@{}'...",
-        raw_handle
-    );
-    let page_url = format!("https://www.youtube.com/@{}", raw_handle);
-    if let Ok(res) = client
-        .get(&page_url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        .send()
-        .await
-    {
-        if let Ok(html) = res.text().await {
-            if let Some(pos) = html.find("itemprop=\"identifier\" content=\"UC") {
-                let id = &html[pos + 31..pos + 55];
-                if id.starts_with("UC") && id.len() == 24 {
-                    info!(
-                        "Successfully resolved '@{}' to Channel ID {} via channel page metadata!",
-                        raw_handle, id
-                    );
-                    return Ok(id.to_string());
-                }
-            }
-            if let Some(pos) = html.find("\"channelId\":\"UC") {
-                let id = &html[pos + 13..pos + 37];
-                if id.starts_with("UC") && id.len() == 24 {
-                    info!(
-                        "Successfully resolved '@{}' to Channel ID {} via channel page data!",
-                        raw_handle, id
-                    );
-                    return Ok(id.to_string());
-                }
-            }
-            if let Some(pos) = html.find("youtube.com/channel/UC") {
-                let id = &html[pos + 20..pos + 44];
-                if id.starts_with("UC") && id.len() == 24 {
-                    info!(
-                        "Successfully resolved '@{}' to Channel ID {} via channel link!",
-                        raw_handle, id
-                    );
-                    return Ok(id.to_string());
-                }
-            }
-        }
-    }
-
     Err(format!(
         "Failed to resolve channel handle/ID '{}'. YouTube requires a 24-character Channel ID starting with 'UC'. Please enter your exact Channel ID (from YouTube Studio -> Customization -> Basic Info) or handle.",
         clean_input
     ).into())
-}
-
-fn extract_streams_from_json(val: &serde_json::Value, out: &mut Vec<StreamInfo>) {
-    match val {
-        serde_json::Value::Object(map) => {
-            if let Some(content_id) = map.get("contentId").and_then(|c| c.as_str()) {
-                if content_id.len() == 11 {
-                    let text_dump = serde_json::to_string(val).unwrap_or_default();
-                    let is_live = text_dump.contains("\"LIVE\"");
-                    let is_upcoming = text_dump.contains("\"Upcoming\"")
-                        || text_dump.contains("scheduledStartTime");
-
-                    if is_live || is_upcoming {
-                        let title = map
-                            .get("rendererContext")
-                            .and_then(|r| r.get("accessibilityContext"))
-                            .and_then(|a| a.get("label"))
-                            .and_then(|l| l.as_str())
-                            .or_else(|| {
-                                map.get("metadata")
-                                    .and_then(|m| m.get("lockupMetadataViewModel"))
-                                    .and_then(|l| l.get("title"))
-                                    .and_then(|t| t.get("content"))
-                                    .and_then(|c| c.as_str())
-                            })
-                            .unwrap_or("Untitled Stream")
-                            .to_string();
-
-                        let status = if is_live { "live" } else { "upcoming" }.to_string();
-                        if !out.iter().any(|s| s.video_id == content_id) {
-                            out.push(StreamInfo {
-                                video_id: content_id.to_string(),
-                                title,
-                                status,
-                                published_at: "".to_string(),
-                                scheduled_start: "".to_string(),
-                                    });
-                        }
-                    }
-                }
-            }
-
-            if let Some(video_id) = map.get("videoId").and_then(|v| v.as_str()) {
-                if video_id.len() == 11 {
-                    let text_dump = serde_json::to_string(val).unwrap_or_default();
-                    let is_live = text_dump.contains("\"LIVE\"")
-                        || text_dump.contains("BADGE_STYLE_TYPE_LIVE_NOW");
-                    let is_upcoming = text_dump.contains("\"Upcoming\"")
-                        || text_dump.contains("UPCOMING")
-                        || text_dump.contains("upcomingEventData");
-
-                    if is_live || is_upcoming {
-                        let title = map
-                            .get("title")
-                            .and_then(|t| t.get("runs"))
-                            .and_then(|r| r.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|f| f.get("text"))
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("Untitled Stream")
-                            .to_string();
-
-                        let status = if is_live { "live" } else { "upcoming" }.to_string();
-                        if !out.iter().any(|s| s.video_id == video_id) {
-                            out.push(StreamInfo {
-                                video_id: video_id.to_string(),
-                                title,
-                                status,
-                                published_at: "".to_string(),
-                                scheduled_start: "".to_string(),
-                                    });
-                        }
-                    }
-                }
-            }
-
-            for v in map.values() {
-                extract_streams_from_json(v, out);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                extract_streams_from_json(v, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Fallback to scraping the public channel streams page to find scheduled public streams
-/// that have not yet been indexed by YouTube's Search API.
-async fn fetch_channel_streams_web(
-    client: &reqwest::Client,
-    channel_id: &str,
-) -> Vec<StreamInfo> {
-    let mut streams = Vec::new();
-    let url = format!("https://www.youtube.com/channel/{}/streams", channel_id);
-
-    let res = match client
-        .get(&url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return streams,
-    };
-
-    let html = match res.text().await {
-        Ok(t) => t,
-        Err(_) => return streams,
-    };
-
-    let marker = "var ytInitialData = ";
-    if let Some(start) = html.find(marker) {
-        let json_str = &html[start + marker.len()..];
-        if let Some(end) = json_str.find(";</script>") {
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&json_str[..end]) {
-                extract_streams_from_json(&data, &mut streams);
-            }
-        }
-    }
-
-    streams
-}
-
-/// Keyless fallback: query YouTube's InnerTube browse API for the channel's
-/// Streams tab (live + scheduled + unlisted). Uses YouTube's own public web
-/// API — NO Data API key required — so it works even when the key is missing,
-/// invalid, or quota-exhausted, and it pins the exact Streams tab instead of
-/// relying on a scraped URL that may redirect to the channel home page.
-async fn fetch_channel_streams_inner(
-    client: &reqwest::Client,
-    channel_id: &str,
-) -> Vec<StreamInfo> {
-    let mut streams = Vec::new();
-    let url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false";
-    let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-    // Channels name their live tab either "Streams" or "Live" — try both params.
-    let tab_params = [
-        "EgZzdHJlYW1z",            // "Streams" tab
-        "EgdzdHJlYW1z8gYECgJ6AA==", // "Live" tab
-    ];
-
-    for params in &tab_params {
-        let body = serde_json::json!({
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": "2.20240718.01.00",
-                    "hl": "en",
-                    "gl": "US",
-                },
-            },
-            "browseId": channel_id,
-            "params": params,
-        });
-
-        let res = match client
-            .post(url)
-            .header("User-Agent", ua)
-            .header("Content-Type", "application/json")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .body(body.to_string())
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                error!("InnerTube browse request failed: {}", e);
-                continue;
-            }
-        };
-
-        match res.json::<serde_json::Value>().await {
-            Ok(json) => {
-                let before = streams.len();
-                extract_streams_from_json(&json, &mut streams);
-                let found = streams.len().saturating_sub(before);
-                if found > 0 {
-                    info!(
-                        "InnerTube discovery for {} found {} stream(s) (params={})",
-                        channel_id, found, params
-                    );
-                }
-            }
-            Err(e) => error!("InnerTube browse response parse failed: {}", e),
-        }
-    }
-
-    info!(
-        "InnerTube total streams-tab discovery for {} found {} stream(s)",
-        channel_id,
-        streams.len()
-    );
-    streams
 }
 
 async fn fetch_streams(
@@ -1866,32 +1488,9 @@ async fn fetch_streams(
             }
         }
 
-        // 3. Supplemental web discovery for public scheduled/live streams on the channel page
-        let web_streams = fetch_channel_streams_web(client, channel_id).await;
-        for ws in web_streams {
-            if !all_streams.iter().any(|s: &StreamInfo| s.video_id == ws.video_id) {
-                info!(
-                    "Discovered stream on channel streams page: {} ({})",
-                    ws.title, ws.video_id
-                );
-                all_streams.push(ws);
-            }
-        }
-
-        // 4. Keyless InnerTube streams-tab fallback (no API key, pins the exact tab).
-        let inner_streams = fetch_channel_streams_inner(client, channel_id).await;
-        for ws in inner_streams {
-            if !all_streams.iter().any(|s: &StreamInfo| s.video_id == ws.video_id) {
-                info!(
-                    "Discovered stream on channel streams tab (InnerTube): {} ({})",
-                    ws.title, ws.video_id
-                );
-                all_streams.push(ws);
-            }
-        }
     }
 
-    // 5. Enrich every discovered stream with its REAL scheduled start time (and
+    // 3. Enrich every discovered stream with its REAL scheduled start time (and
     // the chat id) via the Data API `videos` endpoint. Search items carry the
     // publish date, not the scheduled start — ordering a prompt by publish date
     // puts an old test stream ahead of the one actually starting soonest. The
@@ -2090,9 +1689,9 @@ async fn select_stream(
         println!("  * The stream must be FULLY SCHEDULED with a start time in");
         println!("    YouTube Studio (Live > Manage) before it becomes visible.");
         println!("  * Visibility must be Public or Unlisted. DRAFT and PRIVATE");
-        println!("    streams are invisible to every public discovery method.");
-        println!("  * Unlisted streams CANNOT be found via YouTube Search, but");
-        println!("    they DO show on the channel's Streams tab.");
+        println!("    streams are invisible to the Data API's Search results.");
+        println!("  * Unlisted streams CANNOT be found via YouTube Search —");
+        println!("    monitor them directly by entering a Video ID or URL.");
         println!("  * Public scheduled streams may take a moment to appear.");
         println!("  You can also monitor a stream directly by entering its");
         println!("  Video ID or URL below.");
@@ -2105,7 +1704,7 @@ async fn select_stream(
             module_name,
             instance_uuid,
             "No active streams found",
-            "No live or scheduled stream was found for this channel.\n\nWhy? The stream must be fully scheduled (with a start time) AND Public or Unlisted in YouTube Studio. Draft and Private streams are invisible to every public discovery method (Search API, channel page, InnerTube). Unlisted streams won't appear in Search, but they DO show on the channel's Streams tab.\n\nEnter the Video ID or URL to monitor it directly, or cancel to keep scanning.",
+            "No live or scheduled stream was found for this channel.\n\nWhy? The stream must be fully scheduled (with a start time) AND Public or Unlisted in YouTube Studio. Draft and Private streams are invisible to the Data API's Search results. Unlisted streams won't appear in Search either, so monitor them directly with a Video ID or URL.\n\nEnter the Video ID or URL to monitor it directly, or cancel to keep scanning.",
             "Video ID or URL",
             PromptKind::String,
             prompt_timeout_secs,
@@ -2490,15 +2089,6 @@ fn format_utc_iso(secs: u64) -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
 }
 
-/// The current wall-clock time as an ISO-8601 UTC string.
-fn utc_now_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_utc_iso(secs)
-}
-
 /// Broadcast a Log container to the engine using the CURRENT session identity
 /// (read at send time so reconnects are honored) — the engine surfaces Logs to
 /// the TUI and persists them to the timeline.
@@ -2528,47 +2118,6 @@ async fn send_stream_start_log(
             error!("Failed to send to engine: {}", e);
         }
     }
-}
-
-/// Fetch the YouTube watch page for a video and return its InnerTube live-chat
-/// continuation token plus the visitor data, when the page exposes them. The
-/// token is what the keyless InnerTube `get_live_chat` endpoint accepts — for
-/// BOTH an UPCOMING stream's waiting-room chat AND an already-LIVE stream (the
-/// Data API has no chat id until the stream goes live, but the watch page
-/// exposes the chat continuation keylessly the whole time).
-async fn fetch_inner_chat_continuation(
-    client: &reqwest::Client,
-    video_id: &str,
-) -> Option<(String, String)> {
-    let url = format!("https://www.youtube.com/watch?v={}", video_id);
-    let html = client
-        .get(&url)
-        .header("User-Agent", YOUTUBE_UA)
-        .send()
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-    let visitor = extract_after_marker(&html, "\"visitorData\"", "\"visitorData\":\"").unwrap_or_default();
-    // Prefer the structured `liveChatRenderer` continuation under
-    // `ytInitialData`: this is what a LIVE stream's watch page exposes (an
-    // upcoming waiting room exposes reload data here too).
-    if let Some(token) = extract_live_chat_continuation_from_initial_data(&html) {
-        return Some((token, visitor));
-    }
-    // Fallback: the raw `reloadContinuationData` marker (older/leaner watch
-    // pages that don't inline the conversationBar in `ytInitialData`).
-    let token = extract_after_marker(&html, "reloadContinuationData", "\"continuation\":\"")?;
-    Some((token, visitor))
-}
-
-/// A single chat message parsed from an InnerTube live-chat response.
-struct InnerChatMessage {
-    id: String,
-    author: String,
-    text: String,
-    donation: Option<Donation>,
 }
 
 /// A donation (Super Chat / Super Sticker / membership / gift) parsed out of a
@@ -2750,414 +2299,6 @@ fn donation_from_rest_snippet(snippet: &serde_json::Value) -> Option<Donation> {
     Some(donation)
 }
 
-/// Concatenate the text of an InnerTube text node (`simpleText`, or all
-/// `runs[].text`). Returns "" for absent/unknown shapes.
-fn innertube_text(node: Option<&serde_json::Value>) -> String {
-    let Some(node) = node else {
-        return String::new();
-    };
-    if let Some(s) = node.get("simpleText").and_then(|v| v.as_str()) {
-        return s.to_string();
-    }
-    node.get("runs")
-        .and_then(|v| v.as_array())
-        .map(|runs| {
-            runs.iter()
-                .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
-}
-
-fn innertube_id(r: &serde_json::Value) -> String {
-    json_str(r.get("id"))
-}
-
-fn innertube_author(r: &serde_json::Value) -> String {
-    let author = innertube_text(r.get("authorName"));
-    if author.is_empty() {
-        "Unknown".into()
-    } else {
-        author
-    }
-}
-
-/// Paid renderers may nest the base text renderer; membership/gift ones carry
-/// id/authorName/message directly.
-fn innertube_base(r: &serde_json::Value) -> &serde_json::Value {
-    r.get("liveChatTextMessageRenderer").unwrap_or(r)
-}
-
-/// Parse a donation out of one `addChatItemAction.item`, returning the
-/// renderer's `(id, author, Donation)` when the item is a donation renderer.
-fn innertube_donation(item: &serde_json::Value) -> Option<(String, String, Donation)> {
-    if let Some(r) = item.get("liveChatPaidMessageRenderer") {
-        let b = innertube_base(r);
-        let amount = innertube_text(r.get("purchaseAmountText"));
-        return Some((
-            innertube_id(b),
-            innertube_author(b),
-            Donation {
-                kind: "superchat",
-                amount_micros: 0,
-                currency: String::new(),
-                display: if amount.is_empty() {
-                    "Super Chat".into()
-                } else {
-                    amount
-                },
-                message: innertube_text(b.get("message")),
-            },
-        ));
-    }
-    if let Some(r) = item.get("liveChatPaidStickerRenderer") {
-        let b = innertube_base(r);
-        let amount = innertube_text(r.get("purchaseAmountText"));
-        return Some((
-            innertube_id(b),
-            innertube_author(b),
-            Donation {
-                kind: "supersticker",
-                amount_micros: 0,
-                currency: String::new(),
-                display: if amount.is_empty() {
-                    "Super Sticker".into()
-                } else {
-                    amount
-                },
-                message: String::new(),
-            },
-        ));
-    }
-    if let Some(r) = item.get("liveChatMembershipItemRenderer") {
-        let primary = innertube_text(r.get("headerPrimaryText"));
-        let sub = innertube_text(r.get("headerSubtext"));
-        let display = if !primary.is_empty() {
-            primary
-        } else if !sub.is_empty() {
-            sub
-        } else {
-            "Member".into()
-        };
-        return Some((
-            innertube_id(r),
-            innertube_author(r),
-            Donation {
-                kind: "membership",
-                amount_micros: 0,
-                currency: String::new(),
-                display,
-                message: innertube_text(r.get("message")),
-            },
-        ));
-    }
-    if let Some(r) = item.get("liveChatSponsorshipsGiftPurchaseAnnouncementRenderer") {
-        let header = r
-            .get("header")
-            .and_then(|h| h.get("liveChatSponsorshipsHeaderRenderer"));
-        let display = header
-            .map(|h| innertube_text(h.get("primaryText")))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Gifted memberships".into());
-        let author = header
-            .map(|h| innertube_text(h.get("authorName")))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Unknown".into());
-        return Some((
-            innertube_id(r),
-            author,
-            Donation {
-                kind: "gift",
-                amount_micros: 0,
-                currency: String::new(),
-                display,
-                message: String::new(),
-            },
-        ));
-    }
-    if let Some(r) = item.get("liveChatSponsorshipsGiftRedemptionAnnouncementRenderer") {
-        let display = innertube_text(r.get("message"));
-        return Some((
-            innertube_id(r),
-            innertube_author(r),
-            Donation {
-                kind: "gift",
-                amount_micros: 0,
-                currency: String::new(),
-                display: if display.is_empty() {
-                    "Received a gifted membership".into()
-                } else {
-                    display
-                },
-                message: String::new(),
-            },
-        ));
-    }
-    if let Some(r) = item.get("giftMessageViewModel") {
-        let display = r
-            .get("text")
-            .and_then(|t| t.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let author = r
-            .get("authorName")
-            .and_then(|a| a.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
-        return Some((
-            innertube_id(r),
-            author,
-            Donation {
-                kind: "gift",
-                amount_micros: 0,
-                currency: String::new(),
-                display: if display.is_empty() {
-                    "Gift".into()
-                } else {
-                    display
-                },
-                message: String::new(),
-            },
-        ));
-    }
-    None
-}
-
-/// Poll the InnerTube `get_live_chat` endpoint keylessly. `Some` carries the
-/// parsed page: the messages plus the next continuation token (or `None` when
-/// YouTube returned no continuation). `None` means the request/response could
-/// not be parsed at all (transient — the caller retries).
-async fn poll_inner_chat_page(
-    client: &reqwest::Client,
-    token: &str,
-    visitor_data: &str,
-) -> Option<(Vec<InnerChatMessage>, Option<String>)> {
-    let body = serde_json::json!({
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20240718.01.00",
-                "hl": "en",
-                "gl": "US",
-                "visitorData": visitor_data,
-            },
-        },
-        "continuation": token,
-    });
-    let mut messages = Vec::new();
-    let resp = client
-        .post("https://www.youtube.com/youtubei/v1/live_chat/get_live_chat")
-        .header("Content-Type", "application/json")
-        .header("User-Agent", YOUTUBE_UA)
-        .json(&body)
-        .send()
-        .await;
-    let Ok(resp) = resp else { return None };
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
-        return None;
-    };
-    let lc = json
-        .get("continuationContents")
-        .and_then(|c| c.get("liveChatContinuation"))?;
-    if let Some(actions) = lc.get("actions").and_then(|a| a.as_array()) {
-        for action in actions {
-            let Some(item) = action.get("addChatItemAction").and_then(|a| a.get("item")) else {
-                continue;
-            };
-            if let Some(r) = item.get("liveChatTextMessageRenderer") {
-                let id = innertube_id(r);
-                let author = innertube_author(r);
-                let text = innertube_text(r.get("message"));
-                if !text.is_empty() {
-                    messages.push(InnerChatMessage {
-                        id,
-                        author,
-                        text,
-                        donation: None,
-                    });
-                }
-                continue;
-            }
-            // Super Chats / stickers / memberships / gifts: synthesize a
-            // readable line and carry the structured donation in `raw_data`.
-            if let Some((id, author, donation)) = innertube_donation(item) {
-                let text = donation.raw_message();
-                if !text.is_empty() {
-                    messages.push(InnerChatMessage {
-                        id,
-                        author,
-                        text,
-                        donation: Some(donation),
-                    });
-                }
-            }
-        }
-    }
-    let next = lc
-        .get("continuations")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(continuation_from_entry);
-    Some((messages, next))
-}
-
-/// Waiting-room helper: the messages plus the next continuation token, treating
-/// an unparseable response as an empty page.
-async fn poll_inner_chat(
-    client: &reqwest::Client,
-    token: &str,
-    visitor_data: &str,
-) -> (Vec<InnerChatMessage>, Option<String>) {
-    poll_inner_chat_page(client, token, visitor_data)
-        .await
-        .unwrap_or_default()
-}
-
-/// Forward a batch of chat messages to the engine as `MessagePreProcess`
-/// payloads (platform "youtube"). Deduped against `seen_ids` so a retried poll
-/// of the same page never re-ingests. Reuses the same channel id as the live
-/// chat slot (falling back to the video id).
-async fn forward_inner_chat_messages(
-    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
-    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
-    video_id: &str,
-    seen_ids: &mut SeenMessageIds,
-    messages: &[InnerChatMessage],
-) {
-    if messages.is_empty() {
-        return;
-    }
-    let (auth, module, instance) = {
-        let id = identity.lock().await;
-        (id.auth.clone(), id.module.clone(), id.instance.clone())
-    };
-    for m in messages {
-        if !m.id.is_empty() && seen_ids.is_seen(&m.id) {
-            continue;
-        }
-        info!("[YouTube Chat] {}: {}", m.author, m.text);
-        let raw_data = m
-            .donation
-            .as_ref()
-            .map(|d| d.raw_data_json())
-            .unwrap_or_default();
-        let pre_process = MessagePreProcess {
-            audio: vec![],
-            audio_type: String::new(),
-            message_uuid7: String::new(),
-            raw_message: Some(ChatMessage {
-                platform: "youtube".into(),
-                raw_data,
-                raw_message: m.text.clone(),
-                user_uuid7: m.author.clone(),
-                command: None,
-                channel_id: video_id.to_string(),
-                user_data: None,
-            }),
-        };
-        let container = ContainerForEngine {
-            version: 2,
-            auth_token: auth.clone(),
-            module_name: module.clone(),
-            module_instance_uuid7: instance.clone(),
-            payload: Some(EnginePayload::MessagePreProcess(pre_process)),
-        };
-let mut buf = Vec::new();
-                                 if container.encode(&mut buf).is_ok() {
-                                     let mut w = write_ws.lock().await;
-                                     if let Err(e) = w.send(WsMessage::Binary(buf)).await {
-                                         error!("Failed to send to engine: {}", e);
-                                     }
-        }
-    }
-}
-
-/// Find `needle` after `after` (the first occurrence), then return the quoted
-/// string that follows it. `needle` must include the opening quote, e.g.
-/// `"continuation":"` — the value runs to the next unescaped quote. Used to
-/// pull the InnerTube chat continuation token and the visitor data out of the
-/// watch page. Manual string search — no regex dependency.
-fn extract_after_marker(html: &str, after: &str, needle: &str) -> Option<String> {
-    let base = html.find(after)? + after.len();
-    let from = &html[base..];
-    let needle_pos = from.find(needle)? + needle.len();
-    let rest = &from[needle_pos..];
-    // The value starts immediately after the needle's opening quote.
-    let mut end = 0;
-    while end < rest.len() {
-        if rest.as_bytes()[end] == b'"' {
-            break;
-        }
-        end += 1;
-    }
-    if end == 0 {
-        return None;
-    }
-    Some(rest[..end].to_string())
-}
-
-/// Pull the continuation string out of an InnerTube continuation entry. The
-/// wrapper key varies by context/response (`reloadContinuationData` for an
-/// upcoming waiting room, `invalidationContinuationData`/`timedContinuationData`
-/// for a live chat, `liveChatContinuationData` for some responses), so try them
-/// all. Returns `None` when no non-empty token is present.
-fn continuation_from_entry(entry: &serde_json::Value) -> Option<String> {
-    const KEYS: [&str; 4] = [
-        "reloadContinuationData",
-        "invalidationContinuationData",
-        "timedContinuationData",
-        "liveChatContinuationData",
-    ];
-    for key in KEYS {
-        if let Some(token) = entry
-            .get(key)
-            .and_then(|d| d.get("continuation"))
-            .and_then(|t| t.as_str())
-        {
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Extract the live-chat continuation token from a watch page's inline
-/// `ytInitialData`. The chat lives at
-/// `contents.twoColumnWatchNextResults.conversationBar.liveChatRenderer.continuations`;
-/// this is present for BOTH an upcoming stream's waiting room and an already
-/// LIVE broadcast, which is what makes the keyless read path work for a live
-/// stream. Pure so the extraction is unit-testable without the network.
-fn extract_live_chat_continuation_from_initial_data(html: &str) -> Option<String> {
-    let data = parse_yt_initial_data(html)?;
-    data.pointer(
-        "/contents/twoColumnWatchNextResults/conversationBar/liveChatRenderer/continuations",
-    )
-    .and_then(|c| c.as_array())
-    .and_then(|arr| arr.iter().find_map(continuation_from_entry))
-}
-
-/// Parse the watch page's `ytInitialData` bootstrap JSON. YouTube assigns it as
-/// `var ytInitialData = {...};` on some pages and `window["ytInitialData"] =
-/// {...};` on others; both are handled. The JSON value is followed by more JS,
-/// so parse only the first value with a streaming deserializer.
-fn parse_yt_initial_data(html: &str) -> Option<serde_json::Value> {
-    const MARKERS: [&str; 2] = ["var ytInitialData = ", "window[\"ytInitialData\"] = "];
-    for marker in MARKERS {
-        if let Some(start) = html.find(marker) {
-            let json_str = &html[start + marker.len()..];
-            let mut de = serde_json::Deserializer::from_str(json_str);
-            if let Ok(value) = serde_json::Value::deserialize(&mut de) {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
 /// Push this video's current viewer count to the engine via a `ChannelStats`
 /// payload. The engine stores it and serves it to other modules through the
 /// `channel_viewers` virtual query. Reads the session identity at send time.
@@ -3202,132 +2343,6 @@ fn now_unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Consecutive keyless InnerTube stalls (no next continuation / failed poll)
-/// tolerated before falling back to the keyed Data API — provided the stream is
-/// still live.
-const KEYLESS_STALL_MAX_ATTEMPTS: u32 = 5;
-
-/// Where the monitored stream's live chat is read from.
-enum ChatSource {
-    /// Keyed Data API: the resumable `activeLiveChatId`.
-    Keyed(String),
-    /// Keyless InnerTube: a live-chat continuation token + visitor data.
-    Keyless { token: String, visitor: String },
-}
-
-/// Why the keyless polling loop stopped.
-enum KeylessStop {
-    /// The chat/stream is over — stop monitoring.
-    Ended,
-    /// The keyless path could not be kept alive while the stream is still live —
-    /// fall back to the keyed Data API path.
-    Fallback,
-}
-
-/// Keyless liveness probe result, used to tell "the stream ended" apart from
-/// "the keyless path broke while still live".
-enum StreamLiveness {
-    Live,
-    NotLive,
-    Unknown,
-}
-
-/// Probe the keyless watch page for whether the stream is still live. Network
-/// errors yield `Unknown` (never mistaken for the stream ending).
-async fn probe_stream_liveness(client: &reqwest::Client, video_id: &str) -> StreamLiveness {
-    match fetch_video_from_watch_page(client, video_id).await {
-        Ok(Some(info)) if info.status == "live" => StreamLiveness::Live,
-        Ok(_) => StreamLiveness::NotLive,
-        Err(_) => StreamLiveness::Unknown,
-    }
-}
-
-/// Poll the keyless InnerTube live chat for a LIVE stream until it ends. The
-/// continuation is refreshed from the watch page whenever YouTube stops handing
-/// out a next token (live-chat tokens rotate), so a long stream never drops.
-/// Returns `Ended` when the stream is over and `Fallback` when the keyless path
-/// looks unrecoverable while the stream is still live (the caller then uses the
-/// keyed Data API path).
-#[allow(clippy::too_many_arguments)]
-async fn poll_keyless_chat(
-    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
-    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
-    client: &reqwest::Client,
-    video_id: &str,
-    mut token: String,
-    mut visitor: String,
-    tuning: &Tuning,
-) -> KeylessStop {
-    info!("Connected to keyless InnerTube live chat. Polling messages...");
-    let mut seen = SeenMessageIds::new(tuning.dedup_cap);
-    let mut stall: u32 = 0;
-
-    loop {
-        match poll_inner_chat_page(client, &token, &visitor).await {
-            Some((msgs, next)) => {
-                if !msgs.is_empty() {
-                    info!("Keyless chat returned {} message(s)", msgs.len());
-                }
-                forward_inner_chat_messages(write_ws, identity, video_id, &mut seen, &msgs).await;
-
-                if let Some(t) = next {
-                    // Made progress — clear the stall counter.
-                    stall = 0;
-                    token = t;
-                } else {
-                    // No next token: the continuation may have expired while the
-                    // stream is still live. Refresh it from the watch page.
-                    match fetch_inner_chat_continuation(client, video_id).await {
-                        Some((t, v)) => {
-                            stall = 0;
-                            token = t;
-                            visitor = v;
-                        }
-                        None => {
-                            stall += 1;
-                            match probe_stream_liveness(client, video_id).await {
-                                StreamLiveness::NotLive => {
-                                    info!("Keyless live chat ended (stream is no longer live).");
-                                    return KeylessStop::Ended;
-                                }
-                                StreamLiveness::Live | StreamLiveness::Unknown => {
-                                    if stall >= KEYLESS_STALL_MAX_ATTEMPTS {
-                                        warn!("Keyless live chat could not be refreshed after {} attempts — falling back to the Data API.", stall);
-                                        return KeylessStop::Fallback;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(
-                    tuning.polling_interval_ms as u64,
-                ))
-                .await;
-            }
-            None => {
-                stall += 1;
-                if stall >= KEYLESS_STALL_MAX_ATTEMPTS {
-                    match probe_stream_liveness(client, video_id).await {
-                        StreamLiveness::NotLive => {
-                            info!("Keyless live chat ended.");
-                            return KeylessStop::Ended;
-                        }
-                        StreamLiveness::Live | StreamLiveness::Unknown => {
-                            warn!("Keyless live chat unavailable after {} attempts while live — falling back to the Data API.", stall);
-                            return KeylessStop::Fallback;
-                        }
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    tuning.chat_poll_retry_secs as u64,
-                ))
-                .await;
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
@@ -3344,25 +2359,22 @@ async fn monitor_stream_chat(
 ) {
     let mut attempt = 0u32;
     // Fires the stream-start event exactly once per monitored session: the
-    // first path (Data API or watch-page fallback) to observe the stream live
-    // claims it atomically; every later poll is a no-op.
+    // first poll to observe the stream live claims it atomically; every later
+    // poll is a no-op.
     let stream_start_fired = AtomicBool::new(false);
     // Whether the "all API keys exhausted" acknowledgment prompt has been shown
     // this session. Shown once so the operator isn't spammed every backoff.
     let mut notified_exhausted = false;
-    // Dedup for the keyless waiting-room chat polled before the stream goes
-    // live (the reload token re-fetches the same early messages).
-    let mut waiting_seen = SeenMessageIds::new(tuning.dedup_cap);
-    let chat_source = 'found_chat: loop {
+    let chat_id = 'found_chat: loop {
         attempt += 1;
         if attempt > tuning.chat_open_max_attempts {
             info!("Live chat failed to open after extended monitoring. Returning to stream discovery...");
             return;
         }
 
-        // 1. Try the Data API first (works with a valid key). Resolving
-        //    `activeLiveChatId` also feeds the platform SEND path, even when
-        //    reading then goes keyless below.
+        // Resolve the stream's `activeLiveChatId` via the Data API. The same
+        // call also yields the live status (for the stream-start event and the
+        // viewer count) and the scheduled-wait state for an upcoming stream.
         let api_key = keys.current_key();
         let video_url = format!(
             "https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails,status&id={}&key={}",
@@ -3383,9 +2395,8 @@ async fn monitor_stream_chat(
                         keys.rotate_to_next();
                     } else {
                         if let Some(err) = json.get("error") {
-                            // API key invalid or other error — fall through to watch-page check.
                             if attempt == 1 {
-                                warn!("Data API unavailable for video status: {:?} — using watch-page fallback.", err.get("message").and_then(|m|m.as_str()).unwrap_or("unknown"));
+                                warn!("Data API unavailable for video status: {:?}", err.get("message").and_then(|m|m.as_str()).unwrap_or("unknown"));
                             }
                         }
                         if let Some(items) = json.get("items").and_then(|i| i.as_array()) {
@@ -3442,23 +2453,42 @@ async fn monitor_stream_chat(
                                             info!("{}", log);
                                             send_stream_start_log(write_ws, identity, &log).await;
                                         }
-                                        // Prefer the keyless InnerTube read path
-                                        // for a LIVE stream: it uses no Data API
-                                        // quota, so reading can never hit the
-                                        // project quota blackout. Fall back to the
-                                        // keyed id if InnerTube can't resolve this
-                                        // video's chat.
-                                        if let Some((token, visitor)) =
-                                            fetch_inner_chat_continuation(client, video_id).await
-                                        {
-                                            info!("Stream is LIVE — reading chat keylessly via InnerTube (no API quota).");
-                                            break 'found_chat ChatSource::Keyless { token, visitor };
-                                        }
-                                        break 'found_chat ChatSource::Keyed(id.to_string());
+                                        break 'found_chat id.to_string();
                                     }
                                     if details.get("actualEndTime").is_some() {
                                         info!("Stream has concluded.");
                                         return;
+                                    }
+                                }
+                                // No chat id yet: a scheduled stream is not
+                                // broadcasting. Surface the wait state once (the
+                                // keyed Data API is the only liveness source) and
+                                // keep polling until it goes live.
+                                let broadcast = item
+                                    .get("snippet")
+                                    .and_then(|s| s.get("liveBroadcastContent"))
+                                    .and_then(|b| b.as_str())
+                                    .unwrap_or("");
+                                if broadcast == "upcoming" && attempt % 6 == 1 {
+                                    let title = item
+                                        .get("snippet")
+                                        .and_then(|s| s.get("title"))
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("Untitled Stream");
+                                    info!(
+                                        "Stream '{}' is upcoming. Waiting for it to go live...",
+                                        title
+                                    );
+                                    if attempt == 1 {
+                                        send_stream_start_log(
+                                            write_ws,
+                                            identity,
+                                            &format!(
+                                                "[youtube] monitoring scheduled stream '{}' ({}) — chat will appear when it goes live",
+                                                title, video_id
+                                            ),
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -3467,78 +2497,6 @@ async fn monitor_stream_chat(
                 }
             }
             Err(_) => {}
-        }
-
-        // 2. Keyless watch-page fallback: check isLive / isUpcoming.
-        if let Ok(Some(stream_info)) = fetch_video_from_watch_page(client, video_id).await {
-            if stream_info.status == "live" {
-                // Stream is live: emit the start event once, only if the Data
-                // API path hasn't already claimed it. The watch page carries no
-                // actualStartTime, so use the detection time (ISO UTC).
-                if claim_stream_start(&stream_start_fired) {
-                    let started_at = utc_now_iso();
-                    let log = stream_start_message(video_id, &started_at, &stream_info.title);
-                    info!("{}", log);
-                    send_stream_start_log(write_ws, identity, &log).await;
-                }
-                // Route the LIVE branch through the keyless InnerTube poll: the
-                // watch page always exposes the live-chat continuation, so chat
-                // is read with no API quota. Only when that fails do we keep
-                // retrying (the keyed Data API may resolve it on a later pass).
-                if let Some((token, visitor)) =
-                    fetch_inner_chat_continuation(client, video_id).await
-                {
-                    info!("Stream is LIVE — reading chat keylessly via InnerTube (no API quota).");
-                    break 'found_chat ChatSource::Keyless { token, visitor };
-                }
-                if attempt % 5 == 1 {
-                    warn!(
-                        "Stream is LIVE but neither the keyless InnerTube path nor the \
-                         Data API could resolve its chat. Retrying..."
-                    );
-                }
-            } else {
-                // Upcoming — wait and retry. The waiting-room chat IS live on
-                // YouTube for a scheduled stream (viewers can post before it
-                // goes live), accessible keylessly via InnerTube. Poll it and
-                // forward messages to the engine so term-chat shows them, then
-                // keep checking for the real go-live above.
-                if attempt % 6 == 1 {
-                    info!(
-                        "Stream '{}' is upcoming ({}). Polling the waiting-room chat...",
-                        stream_info.title, stream_info.status
-                    );
-                    if attempt == 1 {
-                        send_stream_start_log(
-                            write_ws,
-                            identity,
-                            &format!(
-                                "[youtube] monitoring scheduled stream '{}' ({}) — waiting-room chat is live until the stream starts",
-                                stream_info.title, video_id
-                            ),
-                        )
-                        .await;
-                    }
-                }
-                // Keyless waiting-room chat: fetch the watch page's reload
-                // continuation token, poll InnerTube, forward messages.
-                if let Some((token, visitor)) =
-                    fetch_inner_chat_continuation(client, video_id).await
-                {
-                    let (msgs, _next) = poll_inner_chat(client, &token, &visitor).await;
-                    if !msgs.is_empty() {
-                        info!("Waiting-room chat returned {} message(s)", msgs.len());
-                    }
-                    forward_inner_chat_messages(
-                        write_ws,
-                        identity,
-                        video_id,
-                        &mut waiting_seen,
-                        &msgs,
-                    )
-                    .await;
-                }
-            }
         }
 
         // Exponential-ish backoff: a short delay for the first few attempts,
@@ -3551,65 +2509,25 @@ async fn monitor_stream_chat(
         tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
     };
 
-    match chat_source {
-        ChatSource::Keyed(chat_id) => {
-            poll_keyed_chat(
-                write_ws,
-                identity,
-                client,
-                keys,
-                live_chat,
-                tuning,
-                prompt_rx,
-                auth_token,
-                module_name,
-                instance_uuid,
-                &mut notified_exhausted,
-                chat_id,
-            )
-            .await;
-        }
-        ChatSource::Keyless { token, visitor } => {
-            match poll_keyless_chat(write_ws, identity, client, video_id, token, visitor, tuning).await
-            {
-                // The chat/stream is over — stop monitoring.
-                KeylessStop::Ended => {}
-                // Keyless stalled while the stream is still live: fall back to
-                // the keyed Data API poll using the live chat id resolved earlier
-                // (when a key was available). With no keyed id there is nothing
-                // to fall back to, so return to stream discovery.
-                KeylessStop::Fallback => {
-                    // Clone the id out so the MutexGuard is dropped before the
-                    // poll's await points (never hold a std lock across await).
-                    let keyed_id = live_chat.lock().unwrap().clone();
-                    if let Some(id) = keyed_id {
-                        info!("Keyless chat path stalled — falling back to the Data API poll.");
-                        poll_keyed_chat(
-                            write_ws,
-                            identity,
-                            client,
-                            keys,
-                            live_chat,
-                            tuning,
-                            prompt_rx,
-                            auth_token,
-                            module_name,
-                            instance_uuid,
-                            &mut notified_exhausted,
-                            id,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
+    poll_keyed_chat(
+        write_ws,
+        identity,
+        client,
+        keys,
+        live_chat,
+        tuning,
+        prompt_rx,
+        auth_token,
+        module_name,
+        instance_uuid,
+        &mut notified_exhausted,
+        chat_id,
+    )
+    .await;
 }
 
 /// Poll the KEYED YouTube Data API live-chat path until the chat closes. The
 /// continuation (`nextPageToken`), key rotation and quota backoff live here.
-/// Used directly when the Data API resolves the stream, and as the fallback
-/// when the keyless InnerTube path can't resolve/keep the chat.
 #[allow(clippy::too_many_arguments)]
 async fn poll_keyed_chat(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
@@ -4403,8 +3321,9 @@ if api_keys.is_empty() {
          2. Create an API key\n\
          3. Enable the YouTube Data API v3\n\n\
          You can add additional keys later for quota rotation by editing\n\
-         config.json. Press Cancel to skip (discovery will still work\n\
-         via InnerTube, but chat monitoring won't).",
+         config.json. A valid Data API key is required for both stream\n\
+         discovery and chat monitoring; without it the module can only use\n\
+         already-saved config or a direct video id.",
         "YouTube Data API Key",
         PromptKind::Credential,
         tuning.prompt_timeout_secs,
@@ -4440,14 +3359,15 @@ if !is_api_key_valid(&client, &key_manager).await {
         &instance_uuid,
         "YouTube API Key Required",
         "Your YouTube Data API key is invalid or missing.\n\n\
-         Stream discovery will still work without a key (via InnerTube),\n\
-         but live chat monitoring requires a valid key.\n\n\
+         A valid Data API key is required for both stream discovery and\n\
+         chat monitoring; without it the module can only use already-saved\n\
+         config or a direct video id.\n\n\
          To get a key:\n\
          1. Go to console.cloud.google.com > APIs & Services > Credentials\n\
          2. Create an API key\n\
          3. Enable the YouTube Data API v3\n\n\
-         Enter your API key below, or press Cancel to continue\n\
-         without chat monitoring (discovery only).",
+         Enter your API key below, or press Cancel to continue without a\n\
+         key (already-saved config / direct video id only).",
         "YouTube Data API Key",
         PromptKind::Credential,
         tuning.prompt_timeout_secs,
@@ -4472,7 +3392,7 @@ if !is_api_key_valid(&client, &key_manager).await {
             }
         }
     } else {
-        info!("No API key provided — continuing with discovery-only mode (InnerTube).");
+        info!("No API key provided — continuing without a key (already-saved config / direct video id only).");
     }
 }
 
@@ -4946,65 +3866,6 @@ mod tests {
     }
 
     #[test]
-    fn test_continuation_from_entry_reads_all_wrapper_keys() {
-        // A live chat's continuation is typically invalidation/timed data, the
-        // waiting room uses reload data, and some responses use
-        // liveChatContinuationData. The helper must read all of them.
-        for key in [
-            "reloadContinuationData",
-            "invalidationContinuationData",
-            "timedContinuationData",
-            "liveChatContinuationData",
-        ] {
-            let entry = json!({ key: { "continuation": format!("tok-{key}") } });
-            assert_eq!(
-                continuation_from_entry(&entry),
-                Some(format!("tok-{key}")),
-                "must read {key}"
-            );
-        }
-        // Absent or empty tokens yield None.
-        assert_eq!(continuation_from_entry(&json!({})), None);
-        assert_eq!(
-            continuation_from_entry(&json!({ "reloadContinuationData": { "continuation": "" } })),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_live_chat_continuation_from_initial_data_live() {
-        // A LIVE watch page exposes the chat continuation under ytInitialData's
-        // conversationBar.liveChatRenderer — the keyless path a live stream now
-        // reads from. This token is an invalidation continuation (live style).
-        let html = r#"<html><script>var ytInitialData = {"contents":{"twoColumnWatchNextResults":{"conversationBar":{"liveChatRenderer":{"continuations":[{"invalidationContinuationData":{"continuation":"LIVE_TOKEN_123","timeoutMs":10000}}]}}}}};var meta = 1;</script></html>"#;
-        assert_eq!(
-            extract_live_chat_continuation_from_initial_data(html),
-            Some("LIVE_TOKEN_123".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_live_chat_continuation_from_initial_data_upcoming() {
-        // An upcoming waiting room uses reloadContinuationData and the
-        // window["ytInitialData"] assignment form — both must be handled.
-        let html = r#"<script>window["ytInitialData"] = {"contents":{"twoColumnWatchNextResults":{"conversationBar":{"liveChatRenderer":{"continuations":[{"reloadContinuationData":{"continuation":"ROOM_TOKEN"}}]}}}}};</script>"#;
-        assert_eq!(
-            extract_live_chat_continuation_from_initial_data(html),
-            Some("ROOM_TOKEN".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_live_chat_continuation_absent_is_none() {
-        let html = r#"<script>var ytInitialData = {"contents":{}};</script>"#;
-        assert_eq!(extract_live_chat_continuation_from_initial_data(html), None);
-        assert_eq!(
-            extract_live_chat_continuation_from_initial_data("<html></html>"),
-            None
-        );
-    }
-
-    #[test]
     fn test_api_key_manager_rotation() {
         let keys = vec![
             "KEY_A".to_string(),
@@ -5182,41 +4043,6 @@ mod tests {
         assert!(seen.is_seen("m3"));
     }
 
-    #[tokio::test]
-    async fn test_resolve_handle_web_fallback() {
-        let client = reqwest::Client::new();
-        let mgr = ApiKeyManager::new(vec![]);
-        let resolved = get_channel_id(&client, "vulbyte", &mgr).await;
-        assert!(resolved.is_ok());
-        assert_eq!(resolved.unwrap(), "UCKZigHbgpJG9ldxXMqmiZUg");
-
-        let resolved_at = get_channel_id(&client, "@vulbyte", &mgr).await;
-        assert!(resolved_at.is_ok());
-        assert_eq!(resolved_at.unwrap(), "UCKZigHbgpJG9ldxXMqmiZUg");
-    }
-
-    #[tokio::test]
-    async fn test_fetch_channel_streams_web() {
-        let client = reqwest::Client::new();
-        let streams = fetch_channel_streams_web(&client, "UCKZigHbgpJG9ldxXMqmiZUg").await;
-        // The channel currently has two scheduled (upcoming) streams. Rather
-        // than pin a video id that changes every stream, assert the discovery
-        // found the channel's known scheduled streams (any of the set that is
-        // live today) and that everything it found is a live/upcoming stream.
-        let known_ids = ["He1xn2br40c", "hHyw0Rkp4SI", "1a2iSWQzl7I"];
-        let found_any_known = streams.iter().any(|s| known_ids.contains(&s.video_id.as_str()));
-        assert!(
-            found_any_known,
-            "Expected at least one known scheduled stream in web discovery: {:?}",
-            streams
-        );
-        assert!(
-            streams.iter().all(|s| s.status == "live" || s.status == "upcoming"),
-            "web discovery returned a non-stream entry: {:?}",
-            streams
-        );
-    }
-
     #[test]
     fn test_backfill_tuning_defaults_creates_and_preserves() {
         let dir = std::env::temp_dir().join(format!("yt_backfill_{}", std::process::id()));
@@ -5289,56 +4115,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Live check (not run in CI): a scheduled (upcoming) stream must be
-    /// reported as "upcoming" by the watch-page fallback — NOT rejected as
-    /// unplayable. Run with:
-    ///   cargo test --release live_watch_page_upcoming -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn live_watch_page_upcoming_reports_upcoming_not_unplayable() {
-        // PROJECT PITT — a scheduled stream on the configured channel.
-        let client = reqwest::Client::new();
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let info = rt
-            .block_on(fetch_video_from_watch_page(&client, "hHyw0Rkp4SI"))
-            .expect("watch page must resolve");
-        let info = info.expect("a scheduled stream must not be rejected as unplayable");
-        assert_eq!(
-            info.status, "upcoming",
-            "LIVE_STREAM_OFFLINE must be treated as upcoming, got {:?}",
-            info.status
-        );
-    }
-
-    /// Live check (not run in CI): an upcoming stream's waiting-room chat is
-    /// keyless-accessible via the InnerTube reload token, and returns real
-    /// messages. Run with:
-    ///   cargo test --release live_inner_chat_waiting_room -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn live_inner_chat_waiting_room_returns_messages() {
-        let client = reqwest::Client::new();
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let (token, visitor) = rt
-            .block_on(fetch_inner_chat_continuation(&client, "hHyw0Rkp4SI"))
-            .expect("must extract the reload continuation token");
-        assert!(!token.is_empty(), "reload token must not be empty");
-        assert!(!visitor.is_empty(), "visitor data must not be empty");
-        let (msgs, _next) = rt.block_on(poll_inner_chat(&client, &token, &visitor));
-        // The scheduled stream's waiting-room chat should return messages (the
-        // operator posts in it before the stream goes live).
-        assert!(
-            !msgs.is_empty(),
-            "expected waiting-room chat messages, got none"
-        );
-        let sample = &msgs[0];
-        assert!(!sample.text.is_empty(), "message text must not be empty");
-        eprintln!(
-            "first waiting-room message: {}: {}",
-            sample.author, sample.text
-        );
     }
 
     fn donation_json(snippet: &serde_json::Value) -> serde_json::Value {
@@ -5493,47 +4269,5 @@ mod tests {
 
         // A snippet with no `type` at all is never a donation.
         assert!(donation_from_rest_snippet(&json!({"displayMessage": "hi"})).is_none());
-    }
-
-    #[test]
-    fn test_innertube_donation_renderers() {
-        // Super Chat: `purchaseAmountText` is the display, `message` the text.
-        let item = json!({
-            "liveChatPaidMessageRenderer": {
-                "id": "sc1",
-                "authorName": { "simpleText": "Carol" },
-                "purchaseAmountText": { "simpleText": "$10.00" },
-                "message": { "runs": [{ "text": "bye!" }] }
-            }
-        });
-        let (id, author, d) = innertube_donation(&item).expect("superchat");
-        assert_eq!(id, "sc1");
-        assert_eq!(author, "Carol");
-        assert_eq!(d.kind, "superchat");
-        assert_eq!(d.display, "$10.00");
-        assert_eq!(d.message, "bye!");
-        assert_eq!(d.raw_message(), "bye!");
-
-        // Membership item: header subtext becomes the display.
-        let item = json!({
-            "liveChatMembershipItemRenderer": {
-                "id": "m1",
-                "authorName": { "simpleText": "Bob" },
-                "headerSubtext": { "simpleText": "Member (2 months)" }
-            }
-        });
-        let (_, _, d) = innertube_donation(&item).expect("membership");
-        assert_eq!(d.kind, "membership");
-        assert_eq!(d.display, "Member (2 months)");
-
-        // A plain text renderer is not a donation.
-        let text = json!({
-            "liveChatTextMessageRenderer": {
-                "id": "t1",
-                "authorName": { "simpleText": "Alice" },
-                "message": { "runs": [{ "text": "hi" }] }
-            }
-        });
-        assert!(innertube_donation(&text).is_none());
     }
 }
