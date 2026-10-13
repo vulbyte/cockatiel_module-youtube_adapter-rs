@@ -416,7 +416,7 @@ impl ApiKeyManager {
             "videonotfound",
             "livestreamingnotenabled",
         ];
-        const KEY_REASONS: [&str; 10] = [
+        const KEY_REASONS: [&str; 8] = [
             "quotaexceeded",
             "ratelimitexceeded",
             "dailylimitexceeded",
@@ -425,8 +425,6 @@ impl ApiKeyManager {
             "api_key_invalid",
             "accessnotconfigured",
             "iprefererblocked",
-            "forbidden",
-            "permission_denied",
         ];
         if let Some(err) = json.get("error") {
             if let Some(errors) = err.get("errors").and_then(|e| e.as_array()) {
@@ -4356,6 +4354,13 @@ mod tests {
         assert!(ApiKeyManager::is_key_error(&key_err("accessNotConfigured")));
         assert!(ApiKeyManager::is_key_error(&key_err("ipRefererBlocked")));
         assert!(ApiKeyManager::is_key_error(&key_err("quotaExceeded")));
+        // A generic 403 `forbidden` is NOT a key error: it must fall through to
+        // the dedicated FORBIDDEN handling so liveChatEnded/Disabled are seen.
+        assert!(!ApiKeyManager::is_key_error(&json!({
+            "error": { "errors": [{ "reason": "forbidden" }] }
+        })));
+        assert!(!ApiKeyManager::is_key_error(&key_err("forbidden")));
+        assert!(!ApiKeyManager::is_key_error(&key_err("permission_denied")));
         // Non-key 403 reasons must not trigger a pointless rotation.
         assert!(!ApiKeyManager::is_key_error(&key_err("liveChatEnded")));
         assert!(!ApiKeyManager::is_key_error(&key_err("liveChatDisabled")));
