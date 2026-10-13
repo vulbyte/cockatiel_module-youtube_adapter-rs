@@ -2568,6 +2568,362 @@ struct InnerChatMessage {
     id: String,
     author: String,
     text: String,
+    donation: Option<Donation>,
+}
+
+/// A donation (Super Chat / Super Sticker / membership / gift) parsed out of a
+/// live-chat message. `amount_micros` is the only 64-bit value here — the
+/// external-protocol exception: YouTube reports Super Chat amounts as
+/// micro-currency strings that a 32-bit int cannot hold.
+#[derive(Debug, Clone, PartialEq)]
+struct Donation {
+    kind: &'static str,
+    amount_micros: i64,
+    currency: String,
+    display: String,
+    message: String,
+}
+
+impl Donation {
+    /// The readable line forwarded as `raw_message`: the user's comment when
+    /// present, otherwise the synthesized display line.
+    fn raw_message(&self) -> String {
+        if self.message.is_empty() {
+            self.display.clone()
+        } else {
+            self.message.clone()
+        }
+    }
+
+    /// The `raw_data` payload the engine and term-chat parse. UTF-8 JSON.
+    fn raw_data_json(&self) -> Vec<u8> {
+        json!({
+            "donation": {
+                "kind": self.kind,
+                "amount_micros": self.amount_micros,
+                "currency": self.currency,
+                "display": self.display,
+                "message": self.message,
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+}
+
+/// Read a string field, defaulting to "".
+fn json_str(v: Option<&serde_json::Value>) -> String {
+    v.and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+/// Parse an amount from a JSON number or numeric string; 0 on absence/overflow.
+fn parse_amount_micros(v: Option<&serde_json::Value>) -> i64 {
+    match v {
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Detect and parse a donation from a REST `liveChatMessages` snippet. Returns
+/// `None` for ordinary chat (or any snippet without a donation `type`), so
+/// callers keep the existing drop-when-empty behaviour for non-donations.
+fn donation_from_rest_snippet(snippet: &serde_json::Value) -> Option<Donation> {
+    let ty = snippet.get("type").and_then(|t| t.as_str())?;
+    let null = serde_json::Value::Null;
+    let details = |key: &str| snippet.get(key).unwrap_or(&null);
+    let donation = match ty {
+        "superChatEvent" | "superStickerEvent" => {
+            let sticker = ty == "superStickerEvent";
+            let d = details(if sticker {
+                "superStickerDetails"
+            } else {
+                "superChatDetails"
+            });
+            let display = json_str(d.get("amountDisplayString"));
+            Donation {
+                kind: if sticker { "supersticker" } else { "superchat" },
+                amount_micros: parse_amount_micros(d.get("amountMicros")),
+                currency: json_str(d.get("currency")),
+                display: if display.is_empty() {
+                    if sticker {
+                        "Super Sticker".into()
+                    } else {
+                        "Super Chat".into()
+                    }
+                } else {
+                    display
+                },
+                message: json_str(d.get("userComment")),
+            }
+        }
+        "newSponsorEvent" => {
+            let d = details("newSponsorDetails");
+            let level = json_str(d.get("memberLevelName"));
+            Donation {
+                kind: "membership",
+                amount_micros: 0,
+                currency: String::new(),
+                display: if level.is_empty() {
+                    "New member".into()
+                } else {
+                    level
+                },
+                message: String::new(),
+            }
+        }
+        "memberMilestoneChatEvent" => {
+            let d = details("memberMilestoneChatDetails");
+            let level = json_str(d.get("memberLevelName"));
+            let month = d.get("memberMonth").and_then(|m| m.as_u64()).unwrap_or(0);
+            let display = match (level.is_empty(), month) {
+                (false, m) if m > 0 => format!("{level} ({m} months)"),
+                (false, _) => level,
+                (true, m) if m > 0 => format!("{m} months"),
+                _ => "Member milestone".into(),
+            };
+            Donation {
+                kind: "membership",
+                amount_micros: 0,
+                currency: String::new(),
+                display,
+                message: json_str(d.get("userComment")),
+            }
+        }
+        "membershipGiftingEvent" => {
+            let d = details("membershipGiftingDetails");
+            let count = d
+                .get("giftMembershipsCount")
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0);
+            let level = json_str(d.get("giftMembershipsLevelName"));
+            let display = if level.is_empty() {
+                format!("Gifted {count} memberships")
+            } else {
+                format!("Gifted {count} x {level}")
+            };
+            Donation {
+                kind: "gift",
+                amount_micros: 0,
+                currency: String::new(),
+                display,
+                message: String::new(),
+            }
+        }
+        "giftMembershipReceivedEvent" => {
+            let d = details("giftMembershipReceivedDetails");
+            let level = json_str(d.get("memberLevelName"));
+            let display = if level.is_empty() {
+                "Received a gifted membership".into()
+            } else {
+                format!("Received a gifted membership ({level})")
+            };
+            Donation {
+                kind: "gift",
+                amount_micros: 0,
+                currency: String::new(),
+                display,
+                message: String::new(),
+            }
+        }
+        "giftEvent" => {
+            let d = details("giftDetails");
+            let alt = json_str(d.get("altText"));
+            let name = json_str(d.get("giftName"));
+            let display = if !alt.is_empty() {
+                alt
+            } else if !name.is_empty() {
+                name
+            } else {
+                "Gift".into()
+            };
+            Donation {
+                kind: "gift",
+                amount_micros: 0,
+                currency: String::new(),
+                display,
+                message: String::new(),
+            }
+        }
+        _ => return None,
+    };
+    Some(donation)
+}
+
+/// Concatenate the text of an InnerTube text node (`simpleText`, or all
+/// `runs[].text`). Returns "" for absent/unknown shapes.
+fn innertube_text(node: Option<&serde_json::Value>) -> String {
+    let Some(node) = node else {
+        return String::new();
+    };
+    if let Some(s) = node.get("simpleText").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    node.get("runs")
+        .and_then(|v| v.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+fn innertube_id(r: &serde_json::Value) -> String {
+    json_str(r.get("id"))
+}
+
+fn innertube_author(r: &serde_json::Value) -> String {
+    let author = innertube_text(r.get("authorName"));
+    if author.is_empty() {
+        "Unknown".into()
+    } else {
+        author
+    }
+}
+
+/// Paid renderers may nest the base text renderer; membership/gift ones carry
+/// id/authorName/message directly.
+fn innertube_base(r: &serde_json::Value) -> &serde_json::Value {
+    r.get("liveChatTextMessageRenderer").unwrap_or(r)
+}
+
+/// Parse a donation out of one `addChatItemAction.item`, returning the
+/// renderer's `(id, author, Donation)` when the item is a donation renderer.
+fn innertube_donation(item: &serde_json::Value) -> Option<(String, String, Donation)> {
+    if let Some(r) = item.get("liveChatPaidMessageRenderer") {
+        let b = innertube_base(r);
+        let amount = innertube_text(r.get("purchaseAmountText"));
+        return Some((
+            innertube_id(b),
+            innertube_author(b),
+            Donation {
+                kind: "superchat",
+                amount_micros: 0,
+                currency: String::new(),
+                display: if amount.is_empty() {
+                    "Super Chat".into()
+                } else {
+                    amount
+                },
+                message: innertube_text(b.get("message")),
+            },
+        ));
+    }
+    if let Some(r) = item.get("liveChatPaidStickerRenderer") {
+        let b = innertube_base(r);
+        let amount = innertube_text(r.get("purchaseAmountText"));
+        return Some((
+            innertube_id(b),
+            innertube_author(b),
+            Donation {
+                kind: "supersticker",
+                amount_micros: 0,
+                currency: String::new(),
+                display: if amount.is_empty() {
+                    "Super Sticker".into()
+                } else {
+                    amount
+                },
+                message: String::new(),
+            },
+        ));
+    }
+    if let Some(r) = item.get("liveChatMembershipItemRenderer") {
+        let primary = innertube_text(r.get("headerPrimaryText"));
+        let sub = innertube_text(r.get("headerSubtext"));
+        let display = if !primary.is_empty() {
+            primary
+        } else if !sub.is_empty() {
+            sub
+        } else {
+            "Member".into()
+        };
+        return Some((
+            innertube_id(r),
+            innertube_author(r),
+            Donation {
+                kind: "membership",
+                amount_micros: 0,
+                currency: String::new(),
+                display,
+                message: innertube_text(r.get("message")),
+            },
+        ));
+    }
+    if let Some(r) = item.get("liveChatSponsorshipsGiftPurchaseAnnouncementRenderer") {
+        let header = r
+            .get("header")
+            .and_then(|h| h.get("liveChatSponsorshipsHeaderRenderer"));
+        let display = header
+            .map(|h| innertube_text(h.get("primaryText")))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Gifted memberships".into());
+        let author = header
+            .map(|h| innertube_text(h.get("authorName")))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Unknown".into());
+        return Some((
+            innertube_id(r),
+            author,
+            Donation {
+                kind: "gift",
+                amount_micros: 0,
+                currency: String::new(),
+                display,
+                message: String::new(),
+            },
+        ));
+    }
+    if let Some(r) = item.get("liveChatSponsorshipsGiftRedemptionAnnouncementRenderer") {
+        let display = innertube_text(r.get("message"));
+        return Some((
+            innertube_id(r),
+            innertube_author(r),
+            Donation {
+                kind: "gift",
+                amount_micros: 0,
+                currency: String::new(),
+                display: if display.is_empty() {
+                    "Received a gifted membership".into()
+                } else {
+                    display
+                },
+                message: String::new(),
+            },
+        ));
+    }
+    if let Some(r) = item.get("giftMessageViewModel") {
+        let display = r
+            .get("text")
+            .and_then(|t| t.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let author = r
+            .get("authorName")
+            .and_then(|a| a.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        return Some((
+            innertube_id(r),
+            author,
+            Donation {
+                kind: "gift",
+                amount_micros: 0,
+                currency: String::new(),
+                display: if display.is_empty() {
+                    "Gift".into()
+                } else {
+                    display
+                },
+                message: String::new(),
+            },
+        ));
+    }
+    None
 }
 
 /// Poll the InnerTube `get_live_chat` endpoint keylessly. `Some` carries the
@@ -2611,33 +2967,32 @@ async fn poll_inner_chat_page(
             let Some(item) = action.get("addChatItemAction").and_then(|a| a.get("item")) else {
                 continue;
             };
-            let Some(r) = item.get("liveChatTextMessageRenderer") else {
+            if let Some(r) = item.get("liveChatTextMessageRenderer") {
+                let id = innertube_id(r);
+                let author = innertube_author(r);
+                let text = innertube_text(r.get("message"));
+                if !text.is_empty() {
+                    messages.push(InnerChatMessage {
+                        id,
+                        author,
+                        text,
+                        donation: None,
+                    });
+                }
                 continue;
-            };
-            let id = r
-                .get("id")
-                .and_then(|i| i.as_str())
-                .unwrap_or("")
-                .to_string();
-            let author = r
-                .get("authorName")
-                .and_then(|a| a.get("simpleText"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            let text = r
-                .get("message")
-                .and_then(|m| m.get("runs"))
-                .and_then(|runs| runs.as_array())
-                .map(|runs| {
-                    runs.iter()
-                        .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            if !text.is_empty() {
-                messages.push(InnerChatMessage { id, author, text });
+            }
+            // Super Chats / stickers / memberships / gifts: synthesize a
+            // readable line and carry the structured donation in `raw_data`.
+            if let Some((id, author, donation)) = innertube_donation(item) {
+                let text = donation.raw_message();
+                if !text.is_empty() {
+                    messages.push(InnerChatMessage {
+                        id,
+                        author,
+                        text,
+                        donation: Some(donation),
+                    });
+                }
             }
         }
     }
@@ -2684,13 +3039,18 @@ async fn forward_inner_chat_messages(
             continue;
         }
         info!("[YouTube Chat] {}: {}", m.author, m.text);
+        let raw_data = m
+            .donation
+            .as_ref()
+            .map(|d| d.raw_data_json())
+            .unwrap_or_default();
         let pre_process = MessagePreProcess {
             audio: vec![],
             audio_type: String::new(),
             message_uuid7: String::new(),
             raw_message: Some(ChatMessage {
                 platform: "youtube".into(),
-                raw_data: Vec::new(),
+                raw_data,
                 raw_message: m.text.clone(),
                 user_uuid7: m.author.clone(),
                 command: None,
@@ -3413,8 +3773,8 @@ async fn poll_keyed_chat(
                                 .and_then(|d| d.as_str())
                                 .unwrap_or("Unknown");
 
-                            let msg = item
-                                .get("snippet")
+                            let snippet = item.get("snippet");
+                            let msg = snippet
                                 .and_then(|s| {
                                     s.get("displayMessage").or_else(|| {
                                         s.get("textMessageDetails")
@@ -3424,19 +3784,33 @@ async fn poll_keyed_chat(
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("");
 
-                            if !msg.is_empty() {
-                                info!("[YouTube Chat] {}: {}", author, msg);
+                            // Donations (Super Chat / membership / gift) carry
+                            // structured `raw_data`; ordinary chat keeps the
+                            // raw item JSON. A donation with an empty
+                            // `displayMessage` must still be forwarded.
+                            let donation = snippet.and_then(donation_from_rest_snippet);
+
+                            if !msg.is_empty() || donation.is_some() {
+                                let (raw_message, raw_data) = match &donation {
+                                    Some(d) => (d.raw_message(), d.raw_data_json()),
+                                    None => (msg.to_string(), item.to_string().as_bytes().to_vec()),
+                                };
+                                info!("[YouTube Chat] {}: {}", author, raw_message);
                                 let pre_process = MessagePreProcess {
-                        audio: vec![],
-                        audio_type: String::new(),
+                                    audio: vec![],
+                                    audio_type: String::new(),
                                     message_uuid7: String::new(),
                                     raw_message: Some(ChatMessage {
                                         platform: "youtube".into(),
-                                        raw_data: item.to_string().as_bytes().to_vec(),
-                                        raw_message: msg.to_string(),
+                                        raw_data,
+                                        raw_message,
                                         user_uuid7: author.to_string(),
                                         command: None,
-                                        channel_id: live_chat.lock().unwrap().clone().unwrap_or_default(),
+                                        channel_id: live_chat
+                                            .lock()
+                                            .unwrap()
+                                            .clone()
+                                            .unwrap_or_default(),
                                         user_data: None,
                                     }),
                                 };
@@ -4961,6 +5335,205 @@ mod tests {
         );
         let sample = &msgs[0];
         assert!(!sample.text.is_empty(), "message text must not be empty");
-        eprintln!("first waiting-room message: {}: {}", sample.author, sample.text);
+        eprintln!(
+            "first waiting-room message: {}: {}",
+            sample.author, sample.text
+        );
+    }
+
+    fn donation_json(snippet: &serde_json::Value) -> serde_json::Value {
+        let d = donation_from_rest_snippet(snippet).expect("expected a donation");
+        serde_json::from_slice(&d.raw_data_json()).expect("raw_data must be valid UTF-8 JSON")
+    }
+
+    #[test]
+    fn test_rest_superchat_donation_raw_data() {
+        let snippet = json!({
+            "type": "superChatEvent",
+            "superChatDetails": {
+                "amountMicros": "5000000",
+                "currency": "USD",
+                "amountDisplayString": "$5.00",
+                "userComment": "great stream",
+                "tier": 2
+            }
+        });
+        let d = donation_from_rest_snippet(&snippet).expect("donation");
+        assert_eq!(d.kind, "superchat");
+        assert_eq!(d.amount_micros, 5_000_000);
+        assert_eq!(d.currency, "USD");
+        assert_eq!(d.display, "$5.00");
+        assert_eq!(d.message, "great stream");
+        assert_eq!(d.raw_message(), "great stream");
+        assert_eq!(
+            donation_json(&snippet),
+            json!({"donation": {
+                "kind": "superchat",
+                "amount_micros": 5_000_000,
+                "currency": "USD",
+                "display": "$5.00",
+                "message": "great stream"
+            }})
+        );
+    }
+
+    #[test]
+    fn test_rest_supersticker_and_empty_comment_not_dropped() {
+        // A Super Chat with no comment must still forward (display line).
+        let snippet = json!({
+            "type": "superChatEvent",
+            "superChatDetails": {
+                "amountMicros": "1000000",
+                "currency": "EUR",
+                "amountDisplayString": "€1.00",
+                "userComment": ""
+            }
+        });
+        let d = donation_from_rest_snippet(&snippet).expect("donation");
+        assert_eq!(d.raw_message(), "€1.00");
+        assert_eq!(d.amount_micros, 1_000_000);
+
+        let sticker = json!({
+            "type": "superStickerEvent",
+            "superStickerDetails": {
+                "amountMicros": "2000000",
+                "currency": "JPY",
+                "amountDisplayString": "¥300"
+            }
+        });
+        assert_eq!(donation_json(&sticker)["donation"]["kind"], "supersticker");
+        assert_eq!(
+            donation_json(&sticker)["donation"]["amount_micros"],
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn test_rest_membership_donation_raw_data() {
+        let milestone = json!({
+            "type": "memberMilestoneChatEvent",
+            "memberMilestoneChatDetails": {
+                "memberLevelName": "Tier 2",
+                "memberMonth": 6,
+                "userComment": "six months!"
+            }
+        });
+        let d = donation_from_rest_snippet(&milestone).expect("donation");
+        assert_eq!(d.kind, "membership");
+        assert_eq!(d.amount_micros, 0);
+        assert_eq!(d.display, "Tier 2 (6 months)");
+        assert_eq!(d.message, "six months!");
+        assert_eq!(d.raw_message(), "six months!");
+        assert_eq!(
+            donation_json(&milestone),
+            json!({"donation": {
+                "kind": "membership",
+                "amount_micros": 0,
+                "currency": "",
+                "display": "Tier 2 (6 months)",
+                "message": "six months!"
+            }})
+        );
+
+        let new_sponsor = json!({
+            "type": "newSponsorEvent",
+            "newSponsorDetails": { "memberLevelName": "Member" }
+        });
+        let d = donation_from_rest_snippet(&new_sponsor).expect("donation");
+        assert_eq!(d.kind, "membership");
+        assert_eq!(d.display, "Member");
+        assert_eq!(d.raw_message(), "Member");
+    }
+
+    #[test]
+    fn test_rest_gift_donation_raw_data() {
+        let gifting = json!({
+            "type": "membershipGiftingEvent",
+            "membershipGiftingDetails": {
+                "giftMembershipsCount": 5,
+                "giftMembershipsLevelName": "Tier 1"
+            }
+        });
+        let d = donation_from_rest_snippet(&gifting).expect("donation");
+        assert_eq!(d.kind, "gift");
+        assert_eq!(d.display, "Gifted 5 x Tier 1");
+        assert_eq!(
+            donation_json(&gifting),
+            json!({"donation": {
+                "kind": "gift",
+                "amount_micros": 0,
+                "currency": "",
+                "display": "Gifted 5 x Tier 1",
+                "message": ""
+            }})
+        );
+
+        let jewels = json!({
+            "type": "giftEvent",
+            "giftDetails": {
+                "giftName": "Gold coin",
+                "jewelsAmount": 10,
+                "altText": "Gold coin",
+                "comboCount": 1
+            }
+        });
+        assert_eq!(donation_json(&jewels)["donation"]["kind"], "gift");
+        assert_eq!(donation_json(&jewels)["donation"]["display"], "Gold coin");
+    }
+
+    #[test]
+    fn test_plain_chat_has_no_donation_raw_data() {
+        // A normal text message has a `type` but no donation fields.
+        let text = json!({
+            "type": "textMessageEvent",
+            "displayMessage": "hello world",
+            "textMessageDetails": { "messageText": "hello world" }
+        });
+        assert!(donation_from_rest_snippet(&text).is_none());
+
+        // A snippet with no `type` at all is never a donation.
+        assert!(donation_from_rest_snippet(&json!({"displayMessage": "hi"})).is_none());
+    }
+
+    #[test]
+    fn test_innertube_donation_renderers() {
+        // Super Chat: `purchaseAmountText` is the display, `message` the text.
+        let item = json!({
+            "liveChatPaidMessageRenderer": {
+                "id": "sc1",
+                "authorName": { "simpleText": "Carol" },
+                "purchaseAmountText": { "simpleText": "$10.00" },
+                "message": { "runs": [{ "text": "bye!" }] }
+            }
+        });
+        let (id, author, d) = innertube_donation(&item).expect("superchat");
+        assert_eq!(id, "sc1");
+        assert_eq!(author, "Carol");
+        assert_eq!(d.kind, "superchat");
+        assert_eq!(d.display, "$10.00");
+        assert_eq!(d.message, "bye!");
+        assert_eq!(d.raw_message(), "bye!");
+
+        // Membership item: header subtext becomes the display.
+        let item = json!({
+            "liveChatMembershipItemRenderer": {
+                "id": "m1",
+                "authorName": { "simpleText": "Bob" },
+                "headerSubtext": { "simpleText": "Member (2 months)" }
+            }
+        });
+        let (_, _, d) = innertube_donation(&item).expect("membership");
+        assert_eq!(d.kind, "membership");
+        assert_eq!(d.display, "Member (2 months)");
+
+        // A plain text renderer is not a donation.
+        let text = json!({
+            "liveChatTextMessageRenderer": {
+                "id": "t1",
+                "authorName": { "simpleText": "Alice" },
+                "message": { "runs": [{ "text": "hi" }] }
+            }
+        });
+        assert!(innertube_donation(&text).is_none());
     }
 }
