@@ -2530,12 +2530,12 @@ async fn send_stream_start_log(
     }
 }
 
-/// Fetch the YouTube watch page for a video and return the InnerTube
-/// `reloadContinuationData` chat continuation token plus the visitor data,
-/// when the page exposes them. The reload token is what the InnerTube
-/// `get_live_chat` endpoint accepts for an UPCOMING stream's waiting-room chat
-/// (the Data API has no chat id until the stream goes live, but the waiting
-/// room chat IS live and keyless-accessible).
+/// Fetch the YouTube watch page for a video and return its InnerTube live-chat
+/// continuation token plus the visitor data, when the page exposes them. The
+/// token is what the keyless InnerTube `get_live_chat` endpoint accepts — for
+/// BOTH an UPCOMING stream's waiting-room chat AND an already-LIVE stream (the
+/// Data API has no chat id until the stream goes live, but the watch page
+/// exposes the chat continuation keylessly the whole time).
 async fn fetch_inner_chat_continuation(
     client: &reqwest::Client,
     video_id: &str,
@@ -2550,8 +2550,16 @@ async fn fetch_inner_chat_continuation(
         .text()
         .await
         .ok()?;
-    let token = extract_after_marker(&html, "reloadContinuationData", "\"continuation\":\"")?;
     let visitor = extract_after_marker(&html, "\"visitorData\"", "\"visitorData\":\"").unwrap_or_default();
+    // Prefer the structured `liveChatRenderer` continuation under
+    // `ytInitialData`: this is what a LIVE stream's watch page exposes (an
+    // upcoming waiting room exposes reload data here too).
+    if let Some(token) = extract_live_chat_continuation_from_initial_data(&html) {
+        return Some((token, visitor));
+    }
+    // Fallback: the raw `reloadContinuationData` marker (older/leaner watch
+    // pages that don't inline the conversationBar in `ytInitialData`).
+    let token = extract_after_marker(&html, "reloadContinuationData", "\"continuation\":\"")?;
     Some((token, visitor))
 }
 
@@ -2562,13 +2570,15 @@ struct InnerChatMessage {
     text: String,
 }
 
-/// Poll the InnerTube `get_live_chat` endpoint keylessly. Returns the messages
-/// plus the next continuation token (or None when the chat is done/closed).
-async fn poll_inner_chat(
+/// Poll the InnerTube `get_live_chat` endpoint keylessly. `Some` carries the
+/// parsed page: the messages plus the next continuation token (or `None` when
+/// YouTube returned no continuation). `None` means the request/response could
+/// not be parsed at all (transient — the caller retries).
+async fn poll_inner_chat_page(
     client: &reqwest::Client,
     token: &str,
     visitor_data: &str,
-) -> (Vec<InnerChatMessage>, Option<String>) {
+) -> Option<(Vec<InnerChatMessage>, Option<String>)> {
     let body = serde_json::json!({
         "context": {
             "client": {
@@ -2589,16 +2599,13 @@ async fn poll_inner_chat(
         .json(&body)
         .send()
         .await;
-    let Ok(resp) = resp else { return (messages, None) };
+    let Ok(resp) = resp else { return None };
     let Ok(json) = resp.json::<serde_json::Value>().await else {
-        return (messages, None);
+        return None;
     };
-    let Some(lc) = json
+    let lc = json
         .get("continuationContents")
-        .and_then(|c| c.get("liveChatContinuation"))
-    else {
-        return (messages, None);
-    };
+        .and_then(|c| c.get("liveChatContinuation"))?;
     if let Some(actions) = lc.get("actions").and_then(|a| a.as_array()) {
         for action in actions {
             let Some(item) = action.get("addChatItemAction").and_then(|a| a.get("item")) else {
@@ -2638,11 +2645,20 @@ async fn poll_inner_chat(
         .get("continuations")
         .and_then(|c| c.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|c| c.get("liveChatContinuationData"))
-        .and_then(|c| c.get("continuation"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
-    (messages, next)
+        .and_then(continuation_from_entry);
+    Some((messages, next))
+}
+
+/// Waiting-room helper: the messages plus the next continuation token, treating
+/// an unparseable response as an empty page.
+async fn poll_inner_chat(
+    client: &reqwest::Client,
+    token: &str,
+    visitor_data: &str,
+) -> (Vec<InnerChatMessage>, Option<String>) {
+    poll_inner_chat_page(client, token, visitor_data)
+        .await
+        .unwrap_or_default()
 }
 
 /// Forward a batch of chat messages to the engine as `MessagePreProcess`
@@ -2723,6 +2739,65 @@ fn extract_after_marker(html: &str, after: &str, needle: &str) -> Option<String>
     Some(rest[..end].to_string())
 }
 
+/// Pull the continuation string out of an InnerTube continuation entry. The
+/// wrapper key varies by context/response (`reloadContinuationData` for an
+/// upcoming waiting room, `invalidationContinuationData`/`timedContinuationData`
+/// for a live chat, `liveChatContinuationData` for some responses), so try them
+/// all. Returns `None` when no non-empty token is present.
+fn continuation_from_entry(entry: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 4] = [
+        "reloadContinuationData",
+        "invalidationContinuationData",
+        "timedContinuationData",
+        "liveChatContinuationData",
+    ];
+    for key in KEYS {
+        if let Some(token) = entry
+            .get(key)
+            .and_then(|d| d.get("continuation"))
+            .and_then(|t| t.as_str())
+        {
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the live-chat continuation token from a watch page's inline
+/// `ytInitialData`. The chat lives at
+/// `contents.twoColumnWatchNextResults.conversationBar.liveChatRenderer.continuations`;
+/// this is present for BOTH an upcoming stream's waiting room and an already
+/// LIVE broadcast, which is what makes the keyless read path work for a live
+/// stream. Pure so the extraction is unit-testable without the network.
+fn extract_live_chat_continuation_from_initial_data(html: &str) -> Option<String> {
+    let data = parse_yt_initial_data(html)?;
+    data.pointer(
+        "/contents/twoColumnWatchNextResults/conversationBar/liveChatRenderer/continuations",
+    )
+    .and_then(|c| c.as_array())
+    .and_then(|arr| arr.iter().find_map(continuation_from_entry))
+}
+
+/// Parse the watch page's `ytInitialData` bootstrap JSON. YouTube assigns it as
+/// `var ytInitialData = {...};` on some pages and `window["ytInitialData"] =
+/// {...};` on others; both are handled. The JSON value is followed by more JS,
+/// so parse only the first value with a streaming deserializer.
+fn parse_yt_initial_data(html: &str) -> Option<serde_json::Value> {
+    const MARKERS: [&str; 2] = ["var ytInitialData = ", "window[\"ytInitialData\"] = "];
+    for marker in MARKERS {
+        if let Some(start) = html.find(marker) {
+            let json_str = &html[start + marker.len()..];
+            let mut de = serde_json::Deserializer::from_str(json_str);
+            if let Ok(value) = serde_json::Value::deserialize(&mut de) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 /// Push this video's current viewer count to the engine via a `ChannelStats`
 /// payload. The engine stores it and serves it to other modules through the
 /// `channel_viewers` virtual query. Reads the session identity at send time.
@@ -2767,6 +2842,132 @@ fn now_unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Consecutive keyless InnerTube stalls (no next continuation / failed poll)
+/// tolerated before falling back to the keyed Data API — provided the stream is
+/// still live.
+const KEYLESS_STALL_MAX_ATTEMPTS: u32 = 5;
+
+/// Where the monitored stream's live chat is read from.
+enum ChatSource {
+    /// Keyed Data API: the resumable `activeLiveChatId`.
+    Keyed(String),
+    /// Keyless InnerTube: a live-chat continuation token + visitor data.
+    Keyless { token: String, visitor: String },
+}
+
+/// Why the keyless polling loop stopped.
+enum KeylessStop {
+    /// The chat/stream is over — stop monitoring.
+    Ended,
+    /// The keyless path could not be kept alive while the stream is still live —
+    /// fall back to the keyed Data API path.
+    Fallback,
+}
+
+/// Keyless liveness probe result, used to tell "the stream ended" apart from
+/// "the keyless path broke while still live".
+enum StreamLiveness {
+    Live,
+    NotLive,
+    Unknown,
+}
+
+/// Probe the keyless watch page for whether the stream is still live. Network
+/// errors yield `Unknown` (never mistaken for the stream ending).
+async fn probe_stream_liveness(client: &reqwest::Client, video_id: &str) -> StreamLiveness {
+    match fetch_video_from_watch_page(client, video_id).await {
+        Ok(Some(info)) if info.status == "live" => StreamLiveness::Live,
+        Ok(_) => StreamLiveness::NotLive,
+        Err(_) => StreamLiveness::Unknown,
+    }
+}
+
+/// Poll the keyless InnerTube live chat for a LIVE stream until it ends. The
+/// continuation is refreshed from the watch page whenever YouTube stops handing
+/// out a next token (live-chat tokens rotate), so a long stream never drops.
+/// Returns `Ended` when the stream is over and `Fallback` when the keyless path
+/// looks unrecoverable while the stream is still live (the caller then uses the
+/// keyed Data API path).
+#[allow(clippy::too_many_arguments)]
+async fn poll_keyless_chat(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    client: &reqwest::Client,
+    video_id: &str,
+    mut token: String,
+    mut visitor: String,
+    tuning: &Tuning,
+) -> KeylessStop {
+    info!("Connected to keyless InnerTube live chat. Polling messages...");
+    let mut seen = SeenMessageIds::new(tuning.dedup_cap);
+    let mut stall: u32 = 0;
+
+    loop {
+        match poll_inner_chat_page(client, &token, &visitor).await {
+            Some((msgs, next)) => {
+                if !msgs.is_empty() {
+                    info!("Keyless chat returned {} message(s)", msgs.len());
+                }
+                forward_inner_chat_messages(write_ws, identity, video_id, &mut seen, &msgs).await;
+
+                if let Some(t) = next {
+                    // Made progress — clear the stall counter.
+                    stall = 0;
+                    token = t;
+                } else {
+                    // No next token: the continuation may have expired while the
+                    // stream is still live. Refresh it from the watch page.
+                    match fetch_inner_chat_continuation(client, video_id).await {
+                        Some((t, v)) => {
+                            stall = 0;
+                            token = t;
+                            visitor = v;
+                        }
+                        None => {
+                            stall += 1;
+                            match probe_stream_liveness(client, video_id).await {
+                                StreamLiveness::NotLive => {
+                                    info!("Keyless live chat ended (stream is no longer live).");
+                                    return KeylessStop::Ended;
+                                }
+                                StreamLiveness::Live | StreamLiveness::Unknown => {
+                                    if stall >= KEYLESS_STALL_MAX_ATTEMPTS {
+                                        warn!("Keyless live chat could not be refreshed after {} attempts — falling back to the Data API.", stall);
+                                        return KeylessStop::Fallback;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    tuning.polling_interval_ms as u64,
+                ))
+                .await;
+            }
+            None => {
+                stall += 1;
+                if stall >= KEYLESS_STALL_MAX_ATTEMPTS {
+                    match probe_stream_liveness(client, video_id).await {
+                        StreamLiveness::NotLive => {
+                            info!("Keyless live chat ended.");
+                            return KeylessStop::Ended;
+                        }
+                        StreamLiveness::Live | StreamLiveness::Unknown => {
+                            warn!("Keyless live chat unavailable after {} attempts while live — falling back to the Data API.", stall);
+                            return KeylessStop::Fallback;
+                        }
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    tuning.chat_poll_retry_secs as u64,
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn monitor_stream_chat(
     write_ws: &tokio::sync::Mutex<WsWriteHalf>,
@@ -2792,16 +2993,16 @@ async fn monitor_stream_chat(
     // Dedup for the keyless waiting-room chat polled before the stream goes
     // live (the reload token re-fetches the same early messages).
     let mut waiting_seen = SeenMessageIds::new(tuning.dedup_cap);
-    let chat_id = 'found_chat: loop {
+    let chat_source = 'found_chat: loop {
         attempt += 1;
         if attempt > tuning.chat_open_max_attempts {
             info!("Live chat failed to open after extended monitoring. Returning to stream discovery...");
             return;
         }
 
-        // 1. Try the Data API first (works with a valid key).
-        let mut got_live_chat_id = false;
-        let mut stream_ended = false;
+        // 1. Try the Data API first (works with a valid key). Resolving
+        //    `activeLiveChatId` also feeds the platform SEND path, even when
+        //    reading then goes keyless below.
         let api_key = keys.current_key();
         let video_url = format!(
             "https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails,status&id={}&key={}",
@@ -2881,7 +3082,19 @@ async fn monitor_stream_chat(
                                             info!("{}", log);
                                             send_stream_start_log(write_ws, identity, &log).await;
                                         }
-                                        break 'found_chat id.to_string();
+                                        // Prefer the keyless InnerTube read path
+                                        // for a LIVE stream: it uses no Data API
+                                        // quota, so reading can never hit the
+                                        // project quota blackout. Fall back to the
+                                        // keyed id if InnerTube can't resolve this
+                                        // video's chat.
+                                        if let Some((token, visitor)) =
+                                            fetch_inner_chat_continuation(client, video_id).await
+                                        {
+                                            info!("Stream is LIVE — reading chat keylessly via InnerTube (no API quota).");
+                                            break 'found_chat ChatSource::Keyless { token, visitor };
+                                        }
+                                        break 'found_chat ChatSource::Keyed(id.to_string());
                                     }
                                     if details.get("actualEndTime").is_some() {
                                         info!("Stream has concluded.");
@@ -2908,13 +3121,20 @@ async fn monitor_stream_chat(
                     info!("{}", log);
                     send_stream_start_log(write_ws, identity, &log).await;
                 }
-                // Stream is live but we can't get the chat ID without the Data API.
-                // Log once and keep trying — the chat ID might become available if
-                // the user provides a real API key later.
+                // Route the LIVE branch through the keyless InnerTube poll: the
+                // watch page always exposes the live-chat continuation, so chat
+                // is read with no API quota. Only when that fails do we keep
+                // retrying (the keyed Data API may resolve it on a later pass).
+                if let Some((token, visitor)) =
+                    fetch_inner_chat_continuation(client, video_id).await
+                {
+                    info!("Stream is LIVE — reading chat keylessly via InnerTube (no API quota).");
+                    break 'found_chat ChatSource::Keyless { token, visitor };
+                }
                 if attempt % 5 == 1 {
                     warn!(
-                        "Stream is LIVE but Data API unavailable to get live chat ID. \
-                         Add a real YouTube Data API key to enable chat monitoring."
+                        "Stream is LIVE but neither the keyless InnerTube path nor the \
+                         Data API could resolve its chat. Retrying..."
                     );
                 }
             } else {
@@ -2971,6 +3191,80 @@ async fn monitor_stream_chat(
         tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
     };
 
+    match chat_source {
+        ChatSource::Keyed(chat_id) => {
+            poll_keyed_chat(
+                write_ws,
+                identity,
+                client,
+                keys,
+                live_chat,
+                tuning,
+                prompt_rx,
+                auth_token,
+                module_name,
+                instance_uuid,
+                &mut notified_exhausted,
+                chat_id,
+            )
+            .await;
+        }
+        ChatSource::Keyless { token, visitor } => {
+            match poll_keyless_chat(write_ws, identity, client, video_id, token, visitor, tuning).await
+            {
+                // The chat/stream is over — stop monitoring.
+                KeylessStop::Ended => {}
+                // Keyless stalled while the stream is still live: fall back to
+                // the keyed Data API poll using the live chat id resolved earlier
+                // (when a key was available). With no keyed id there is nothing
+                // to fall back to, so return to stream discovery.
+                KeylessStop::Fallback => {
+                    // Clone the id out so the MutexGuard is dropped before the
+                    // poll's await points (never hold a std lock across await).
+                    let keyed_id = live_chat.lock().unwrap().clone();
+                    if let Some(id) = keyed_id {
+                        info!("Keyless chat path stalled — falling back to the Data API poll.");
+                        poll_keyed_chat(
+                            write_ws,
+                            identity,
+                            client,
+                            keys,
+                            live_chat,
+                            tuning,
+                            prompt_rx,
+                            auth_token,
+                            module_name,
+                            instance_uuid,
+                            &mut notified_exhausted,
+                            id,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Poll the KEYED YouTube Data API live-chat path until the chat closes. The
+/// continuation (`nextPageToken`), key rotation and quota backoff live here.
+/// Used directly when the Data API resolves the stream, and as the fallback
+/// when the keyless InnerTube path can't resolve/keep the chat.
+#[allow(clippy::too_many_arguments)]
+async fn poll_keyed_chat(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    client: &reqwest::Client,
+    keys: &ApiKeyManager,
+    live_chat: &Arc<Mutex<Option<String>>>,
+    tuning: &Tuning,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    notified_exhausted: &mut bool,
+    chat_id: String,
+) {
     info!(
         "Connected to live chat ID: {}. Polling messages...",
         chat_id
@@ -3029,7 +3323,7 @@ async fn monitor_stream_chat(
                                     module_name,
                                     instance_uuid,
                                     tuning.prompt_timeout_secs,
-                                    &mut notified_exhausted,
+                                    notified_exhausted,
                                 )
                                 .await;
                                 std::time::Duration::from_secs(tuning.quota_backoff_secs as u64)
@@ -4275,6 +4569,65 @@ mod tests {
         assert_eq!(extract_video_id("@vulbyte"), None);
         assert_eq!(extract_video_id("vulbyte"), None);
         assert_eq!(extract_video_id("UCKZigHbgpJG9ldxXMqmiZUg"), None);
+    }
+
+    #[test]
+    fn test_continuation_from_entry_reads_all_wrapper_keys() {
+        // A live chat's continuation is typically invalidation/timed data, the
+        // waiting room uses reload data, and some responses use
+        // liveChatContinuationData. The helper must read all of them.
+        for key in [
+            "reloadContinuationData",
+            "invalidationContinuationData",
+            "timedContinuationData",
+            "liveChatContinuationData",
+        ] {
+            let entry = json!({ key: { "continuation": format!("tok-{key}") } });
+            assert_eq!(
+                continuation_from_entry(&entry),
+                Some(format!("tok-{key}")),
+                "must read {key}"
+            );
+        }
+        // Absent or empty tokens yield None.
+        assert_eq!(continuation_from_entry(&json!({})), None);
+        assert_eq!(
+            continuation_from_entry(&json!({ "reloadContinuationData": { "continuation": "" } })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_live_chat_continuation_from_initial_data_live() {
+        // A LIVE watch page exposes the chat continuation under ytInitialData's
+        // conversationBar.liveChatRenderer — the keyless path a live stream now
+        // reads from. This token is an invalidation continuation (live style).
+        let html = r#"<html><script>var ytInitialData = {"contents":{"twoColumnWatchNextResults":{"conversationBar":{"liveChatRenderer":{"continuations":[{"invalidationContinuationData":{"continuation":"LIVE_TOKEN_123","timeoutMs":10000}}]}}}}};var meta = 1;</script></html>"#;
+        assert_eq!(
+            extract_live_chat_continuation_from_initial_data(html),
+            Some("LIVE_TOKEN_123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_live_chat_continuation_from_initial_data_upcoming() {
+        // An upcoming waiting room uses reloadContinuationData and the
+        // window["ytInitialData"] assignment form — both must be handled.
+        let html = r#"<script>window["ytInitialData"] = {"contents":{"twoColumnWatchNextResults":{"conversationBar":{"liveChatRenderer":{"continuations":[{"reloadContinuationData":{"continuation":"ROOM_TOKEN"}}]}}}}};</script>"#;
+        assert_eq!(
+            extract_live_chat_continuation_from_initial_data(html),
+            Some("ROOM_TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_live_chat_continuation_absent_is_none() {
+        let html = r#"<script>var ytInitialData = {"contents":{}};</script>"#;
+        assert_eq!(extract_live_chat_continuation_from_initial_data(html), None);
+        assert_eq!(
+            extract_live_chat_continuation_from_initial_data("<html></html>"),
+            None
+        );
     }
 
     #[test]
