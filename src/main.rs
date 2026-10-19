@@ -497,6 +497,23 @@ async fn is_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> boo
     }
 }
 
+/// True if ANY configured key reaches the API. Rotates past the current key so a
+/// single exhausted/invalid key (e.g. key 1 at its daily quota) does not make the
+/// startup check declare the whole ring invalid and spuriously re-prompt for a
+/// key that is already there.
+async fn any_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> bool {
+    let attempts = keys.key_count().max(1);
+    for _ in 0..attempts {
+        if is_api_key_valid(client, keys).await {
+            return true;
+        }
+        if keys.key_count() > 1 {
+            keys.rotate_to_next();
+        }
+    }
+    false
+}
+
 /// Build a moderator query from the engine-routed command. The engine already
 /// parsed + routed `!ban`/`!timeout`; here we map command_name -> query and
 /// extract the target/reason from the message args (no re-parsing).
@@ -3348,12 +3365,17 @@ info!(
     key_manager.key_count()
 );
 
-// ── Validate the API key early ──────────────────────────────────────
-// If the key is invalid (e.g. the placeholder "testkey"), prompt the
-// user to enter a real key via the TUI prompt dialog so they never have
-// to manually edit a config file.
-if !is_api_key_valid(&client, &key_manager).await {
-    warn!("YouTube API key is invalid or missing. Prompting user for a valid key...");
+// ── Validate the API keys early ──────────────────────────────────────
+// Prompt only when NO configured key works. A ring whose current key is
+// quota-exhausted (but another is fine) must NOT be reported as invalid — the
+// adapter rotates during polling anyway, so re-prompting for a key that already
+// exists just confuses the operator. Prompt only when the whole ring is dead
+// (e.g. the placeholder "testkey") so they never have to edit the config by hand.
+if !any_api_key_valid(&client, &key_manager).await {
+    warn!(
+        "No usable YouTube API key among {} configured. Prompting for a valid key...",
+        key_manager.key_count()
+    );
     let new_key = prompt_for_input(
         &write_ws_cockatiel,
         &mut prompt_rx,
