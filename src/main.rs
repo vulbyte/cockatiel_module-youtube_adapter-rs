@@ -2425,6 +2425,40 @@ async fn push_channel_stats(
     }
 }
 
+/// Surface a non-blocking `StatusNotice` to the engine, which relays it to every
+/// connected module for display. An empty `text` clears the notice for
+/// `source`. Reads the session identity at send time so reconnects are honored.
+async fn send_status_notice(
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    source: &str,
+    level: &str,
+    text: &str,
+    ttl_secs: i32,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = ContainerForEngine {
+        version: 2,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(EnginePayload::StatusNotice(cockatiel_client::proto::StatusNotice {
+            source: source.to_string(),
+            level: level.to_string(),
+            text: text.to_string(),
+            ttl_secs,
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_ws.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+}
+
 fn now_unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2671,6 +2705,9 @@ async fn poll_keyed_chat(
     // ring is exhausted, so wait the full quota backoff and only resume fast
     // polling once a key answers non-quota again.
     let mut quota_failures: u32 = 0;
+    // Whether the quota-exhausted StatusNotice is currently showing, so it is
+    // published once per exhausted episode and cleared on the next success.
+    let mut notice_exhausted = false;
     // Live-chat message ids already forwarded to the engine this session, so a
     // timed-out poll retried with the same page token never re-ingests them.
     let mut seen_ids = SeenMessageIds::new(tuning.dedup_cap);
@@ -2711,6 +2748,24 @@ async fn poll_keyed_chat(
                             // spinning against a quota-exhausted API.
                             let delay = if quota_failures >= key_count {
                                 info!("All configured API keys are quota-exhausted; backing off {}s before polling again.", tuning.quota_backoff_secs);
+                                // Surface a non-blocking banner so the UI shows
+                                // chat is paused on API limits (published once
+                                // per exhausted episode).
+                                if !notice_exhausted {
+                                    notice_exhausted = true;
+                                    send_status_notice(
+                                        write_ws,
+                                        identity,
+                                        "youtube",
+                                        "warning",
+                                        "YouTube API quota exhausted — all configured keys are at \
+                                         their limit, so live chat monitoring is paused. The quota \
+                                         resets automatically (typically every 24h); the adapter \
+                                         will resume chat as soon as a key is available again.",
+                                        0,
+                                    )
+                                    .await;
+                                }
                                 // Surface it to the operator ONCE per session: a
                                 // Boolean prompt they must acknowledge so they know
                                 // chat monitoring is paused on API limits (the keys
@@ -2753,6 +2808,12 @@ async fn poll_keyed_chat(
                     }
                     // A non-key-error response means at least one key is healthy.
                     quota_failures = 0;
+                    // A poll succeeded again after an exhausted episode: clear
+                    // the quota banner.
+                    if notice_exhausted {
+                        notice_exhausted = false;
+                        send_status_notice(write_ws, identity, "youtube", "info", "", 0).await;
+                    }
 
                     if status == reqwest::StatusCode::NOT_FOUND {
                         info!("Live chat closed (Not found).");
