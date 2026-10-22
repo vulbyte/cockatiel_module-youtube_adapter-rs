@@ -169,7 +169,7 @@ impl YoutubeAdapterConfig {
         60
     }
     fn poll_retry_delay_ms() -> u32 {
-        500
+        2000
     }
     fn polling_interval_ms() -> u32 {
         5000
@@ -650,7 +650,7 @@ fn backfill_tuning_defaults_at(path: &std::path::Path) {
         ("chat_open_backoff_later_secs", 30),
         ("dedup_cap", 10_000),
         ("quota_backoff_secs", 60),
-        ("poll_retry_delay_ms", 500),
+        ("poll_retry_delay_ms", 2000),
         ("polling_interval_ms", 5000),
         ("chat_poll_retry_secs", 5),
         ("oauth_capture_timeout_secs", 120),
@@ -665,6 +665,12 @@ fn backfill_tuning_defaults_at(path: &std::path::Path) {
         if ms.get(key).is_none() {
             ms[key] = serde_json::json!(value);
         }
+    }
+    // Migrate the old poll-retry default (500ms — it hammered the API under
+    // quota pressure) to the new less-aggressive base. Only rewritten while it
+    // still holds the OLD default, so an explicit operator choice survives.
+    if ms.get("poll_retry_delay_ms").and_then(|v| v.as_i64()) == Some(500) {
+        ms["poll_retry_delay_ms"] = serde_json::json!(2000);
     }
     if ms != before {
         json_val["module_specific"] = ms;
@@ -2609,6 +2615,35 @@ async fn monitor_stream_chat(
     .await;
 }
 
+/// Live-chat poll interval bounds (ms). The Data API's `pollingIntervalMillis`
+/// can hand back absurd values under load; clamp both it and the config
+/// fallback to a sane [1s, 60s] range before any jitter is applied.
+const POLL_INTERVAL_MIN_MS: u64 = 1_000;
+const POLL_INTERVAL_MAX_MS: u64 = 60_000;
+
+/// Clamp a poll interval to [`POLL_INTERVAL_MIN_MS`, `POLL_INTERVAL_MAX_MS`]
+/// then spread it by ±10%. The jitter comes from a cheap time-seeded xorshift
+/// (no RNG dependency) so independent pollers don't align on the same cadence.
+fn jittered_poll_interval_ms(interval_ms: u64) -> u64 {
+    let clamped = interval_ms.clamp(POLL_INTERVAL_MIN_MS, POLL_INTERVAL_MAX_MS);
+    let span = clamped / 10;
+    if span == 0 {
+        return clamped;
+    }
+    let mut x = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15)
+        .max(1);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let offset = (x % (2 * span + 1)) as i64 - span as i64;
+    (clamped as i64 + offset).clamp(POLL_INTERVAL_MIN_MS as i64, POLL_INTERVAL_MAX_MS as i64)
+        as u64
+}
+
 /// Poll the KEYED YouTube Data API live-chat path until the chat closes. The
 /// continuation (`nextPageToken`), key rotation and quota backoff live here.
 #[allow(clippy::too_many_arguments)]
@@ -2631,10 +2666,10 @@ async fn poll_keyed_chat(
         chat_id
     );
     let mut next_page_token: Option<String> = None;
-    // Consecutive quota failures on the poll path. Once every configured key
-    // has failed in a row the whole ring is exhausted — hammering it every
-    // 500ms just burns quota-exhausted API calls, so back off and only resume
-    // fast polling once a key answers non-quota again.
+    // Consecutive quota failures on the poll path. Each failure backs off
+    // exponentially; once every configured key has failed in a row the whole
+    // ring is exhausted, so wait the full quota backoff and only resume fast
+    // polling once a key answers non-quota again.
     let mut quota_failures: u32 = 0;
     // Live-chat message ids already forwarded to the engine this session, so a
     // timed-out poll retried with the same page token never re-ingests them.
@@ -2643,6 +2678,9 @@ async fn poll_keyed_chat(
     // token (a retry after a timeout) AND the items carry no usable ids, the
     // page was already forwarded — skip it instead of re-ingesting.
     let mut last_processed_token: Option<String> = None;
+    // Log the effective (clamped + jittered) poll interval once so the operator
+    // can see the rate the adapter actually settled into.
+    let mut interval_logged = false;
 
     loop {
         let api_key = keys.current_key();
@@ -2670,7 +2708,7 @@ async fn poll_keyed_chat(
                             );
                             keys.rotate_to_next();
                             // Full ring rotated with no success: back off instead of
-                            // spinning every 500ms against a quota-exhausted API.
+                            // spinning against a quota-exhausted API.
                             let delay = if quota_failures >= key_count {
                                 info!("All configured API keys are quota-exhausted; backing off {}s before polling again.", tuning.quota_backoff_secs);
                                 // Surface it to the operator ONCE per session: a
@@ -2689,7 +2727,15 @@ async fn poll_keyed_chat(
                                 .await;
                                 std::time::Duration::from_secs(tuning.quota_backoff_secs as u64)
                             } else {
-                                std::time::Duration::from_millis(tuning.poll_retry_delay_ms as u64)
+                                // Per-key consecutive quota failures: back off
+                                // exponentially from the poll retry base
+                                // (2s, 4s, 8s, ...), capped at the full
+                                // all-keys-exhausted wait.
+                                let exp = 1u64 << quota_failures.saturating_sub(1).min(31);
+                                let backoff_ms = (tuning.poll_retry_delay_ms as u64)
+                                    .saturating_mul(exp)
+                                    .min(tuning.quota_backoff_secs as u64 * 1000);
+                                std::time::Duration::from_millis(backoff_ms)
                             };
                             tokio::time::sleep(delay).await;
                         } else {
@@ -2738,11 +2784,21 @@ async fn poll_keyed_chat(
                         }
                     }
 
-                    let interval = json
+                    // The API's suggested interval (or the config fallback) is
+                    // read as u64, clamped, then jittered. Clamp BEFORE anything
+                    // narrows it: a hostile value must not wrap through u32.
+                    let requested_interval_ms = json
                         .get("pollingIntervalMillis")
                         .and_then(|v| v.as_u64())
-                        .map(|v| v as u32)
-                        .unwrap_or(tuning.polling_interval_ms);
+                        .unwrap_or(tuning.polling_interval_ms as u64);
+                    let interval = jittered_poll_interval_ms(requested_interval_ms);
+                    if !interval_logged {
+                        info!(
+                            "Live-chat effective poll interval: {} ms (requested {} ms)",
+                            interval, requested_interval_ms
+                        );
+                        interval_logged = true;
+                    }
 
                     if let Some(new_token) = json.get("nextPageToken").and_then(|v| v.as_str()) {
                         next_page_token = Some(new_token.to_string());
@@ -2842,7 +2898,7 @@ async fn poll_keyed_chat(
                     // (e.g. after a timeout) must not re-forward it.
                     last_processed_token = requested_token;
 
-                    tokio::time::sleep(tokio::time::Duration::from_millis(interval as u64)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(interval)).await;
                 } else {
                     if status == reqwest::StatusCode::FORBIDDEN
                         || status == reqwest::StatusCode::NOT_FOUND
@@ -4123,7 +4179,7 @@ mod tests {
         assert_eq!(cfg.chat_open_backoff_later_secs, 30);
         assert_eq!(cfg.dedup_cap, 10_000);
         assert_eq!(cfg.quota_backoff_secs, 60);
-        assert_eq!(cfg.poll_retry_delay_ms, 500);
+        assert_eq!(cfg.poll_retry_delay_ms, 2000);
         assert_eq!(cfg.polling_interval_ms, 5000);
         assert_eq!(cfg.chat_poll_retry_secs, 5);
         assert_eq!(cfg.oauth_capture_timeout_secs, 120);
@@ -4140,6 +4196,29 @@ mod tests {
         assert_eq!(cfg.http_timeout_secs, 7);
         assert_eq!(cfg.prompt_timeout_secs, 90);
         assert_eq!(cfg.default_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_jittered_poll_interval_clamps_and_stays_in_bounds() {
+        // Absurd API values must clamp into [1s, 60s] and never escape, however
+        // large the requested value (regression: a u64 truncated to u32 first).
+        for requested in [0u64, 1, 999, 1_000, 5_000, 60_000, 60_001, 600_000, u64::MAX] {
+            for _ in 0..64 {
+                let out = jittered_poll_interval_ms(requested);
+                assert!(
+                    (POLL_INTERVAL_MIN_MS..=POLL_INTERVAL_MAX_MS).contains(&out),
+                    "requested {requested} -> {out} escaped bounds"
+                );
+            }
+        }
+        // An in-range value jitters by at most ±10%.
+        for _ in 0..64 {
+            let out = jittered_poll_interval_ms(5_000);
+            assert!(
+                (4_500..=5_500).contains(&out),
+                "5000 -> {out} exceeded ±10%"
+            );
+        }
     }
 
     #[test]
@@ -4192,6 +4271,28 @@ mod tests {
         assert_eq!(ms["default_timeout_secs"], 900, "existing value preserved");
         assert_eq!(ms["http_timeout_secs"], 15, "missing key backfilled");
         assert_eq!(ms.len(), 19);
+
+        // The OLD poll-retry default (500) migrates to the new 2000 base...
+        std::fs::write(
+            &path,
+            r#"{"module_specific":{"poll_retry_delay_ms":500}}"#,
+        )
+        .unwrap();
+        backfill_tuning_defaults_at(&path);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["module_specific"]["poll_retry_delay_ms"], 2000);
+
+        // ...but an explicit non-default value is left untouched.
+        std::fs::write(
+            &path,
+            r#"{"module_specific":{"poll_retry_delay_ms":750}}"#,
+        )
+        .unwrap();
+        backfill_tuning_defaults_at(&path);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["module_specific"]["poll_retry_delay_ms"], 750);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
