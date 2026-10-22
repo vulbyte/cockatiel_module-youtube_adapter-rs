@@ -478,40 +478,82 @@ fn rotated_refresh_token(resp: &serde_json::Value, current: &str) -> Option<Stri
         .map(|s| s.to_string())
 }
 
+/// Result of probing an API key. `Unknown` means the probe never produced a
+/// definitive answer (network/TLS failure, timeout, non-JSON body) — the key is
+/// NOT known to be invalid, so callers must not rotate or re-prompt for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyValidity {
+    Valid,
+    Invalid,
+    Unknown,
+}
+
 /// Tests whether the current YouTube API key is valid by making a lightweight videos.list request (1 quota unit).
-async fn is_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> bool {
+async fn is_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> KeyValidity {
     let api_key = keys.current_key();
     if api_key.is_empty() {
-        return false;
+        return KeyValidity::Invalid;
     }
     let url = format!(
         "https://www.googleapis.com/youtube/v3/videos?part=id&id=dQw4w9WgXcQ&key={}",
         api_key
     );
     match client.get(&url).send().await {
-        Ok(res) => match res.json::<serde_json::Value>().await {
-            Ok(json) => json.get("error").is_none(),
-            Err(_) => false,
-        },
-        Err(_) => false,
+        Ok(res) => {
+            let status = res.status();
+            match res.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    if json.get("error").is_none() {
+                        KeyValidity::Valid
+                    } else if status.is_client_error() {
+                        // A 4xx with a Google API error body is a definitive
+                        // rejection (bad key, API not enabled, quota, etc.).
+                        KeyValidity::Invalid
+                    } else {
+                        // Error body on a 5xx/3xx: server-side problem, not the
+                        // key's fault. Treat as unknown so we retry later.
+                        KeyValidity::Unknown
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not parse YouTube API key validation response: {}", e);
+                    KeyValidity::Unknown
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Could not reach YouTube API to validate key ({}); treating key as unknown.",
+                e
+            );
+            KeyValidity::Unknown
+        }
     }
 }
 
 /// True if ANY configured key reaches the API. Rotates past the current key so a
 /// single exhausted/invalid key (e.g. key 1 at its daily quota) does not make the
 /// startup check declare the whole ring invalid and spuriously re-prompt for a
-/// key that is already there.
-async fn any_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> bool {
+/// key that is already there. Returns `Unknown` when no key was definitively
+/// rejected but at least one probe failed for transport/parse reasons.
+async fn any_api_key_valid(client: &reqwest::Client, keys: &ApiKeyManager) -> KeyValidity {
     let attempts = keys.key_count().max(1);
+    let mut saw_unknown = false;
     for _ in 0..attempts {
-        if is_api_key_valid(client, keys).await {
-            return true;
+        match is_api_key_valid(client, keys).await {
+            KeyValidity::Valid => return KeyValidity::Valid,
+            KeyValidity::Unknown => saw_unknown = true,
+            KeyValidity::Invalid => {}
         }
         if keys.key_count() > 1 {
             keys.rotate_to_next();
         }
     }
-    false
+    if saw_unknown {
+        KeyValidity::Unknown
+    } else {
+        KeyValidity::Invalid
+    }
 }
 
 /// Build a moderator query from the engine-routed command. The engine already
@@ -1613,11 +1655,20 @@ async fn prompt_for_input(
     };
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_err() {
+        error!(
+            "Could not encode '{}' prompt for the engine — no UI can answer it.",
+            title
+        );
         return None;
     }
     {
         let mut w = write_ws.lock().await;
         if w.send(WsMessage::Binary(buf.into())).await.is_err() {
+            warn!(
+                "Could not send '{}' prompt to the engine — no UI can answer it. \
+                 Is the TUI connected?",
+                title
+            );
             return None;
         }
     }
@@ -1633,13 +1684,28 @@ async fn prompt_for_input(
                 };
             }
             Ok(Some(_)) => continue, // a different prompt's response
-            Ok(None) => return None,
+            Ok(None) => {
+                warn!(
+                    "Prompt '{}' could not be delivered — the engine closed the prompt \
+                     channel with no UI response. Connect the TUI to enter \
+                     credentials/values.",
+                    title
+                );
+                return None;
+            }
             // The 10s poll interval elapsed with no response yet: keep waiting
             // until the real deadline (the `timeout` seconds above), rather than
             // bailing out 10 seconds in and auto-cancelling every prompt.
             Err(_) => continue,
         }
     }
+    warn!(
+        "Prompt '{}' timed out after {}s with no response — no UI answered it. \
+         The TUI must be connected to enter credentials/values; the adapter cannot \
+         continue setup without an answer.",
+        title,
+        timeout as u64 + 10
+    );
     None
 }
 
@@ -2812,6 +2878,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting YouTube Adapter Module...");
 
+    // Secrets (`YOUTUBE_API_KEY`, OAuth client id/secret, refresh token) live in
+    // `.env`. Load it BEFORE anything reads credentials: `load_adapter_config`
+    // and the OAuth manager both read process env vars, so loading it later left
+    // them empty (sending disabled, browser flow never started).
+    ensure_env_file();
+    cockatiel_client::load_env_file(".env");
+
     let cockatiel = CockatielClient::connect("config.json").await?;
 
     let (write_ws_cockatiel, read_ws_cockatiel) = cockatiel.stream.split();
@@ -2884,28 +2957,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The live chat id currently being monitored (shared with the send task).
     let live_chat: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    // If we have OAuth app credentials but no refresh token yet, acquire one
-    // now via the browser flow (bounded so it can never hang forever).
-    if oauth.has_creds() && oauth_refresh.is_empty() {
-        info!("No YouTube refresh token yet — opening browser to authorize sending...");
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(tuning.oauth_capture_timeout_secs as u64),
-            oauth.acquire_refresh_token(&client),
-        )
-        .await
-        {
-            Ok(Ok(refresh)) => {
-                info!("Acquired YouTube refresh token (sending enabled).");
-                save_oauth_refresh_token(&refresh);
-            }
-            Ok(Err(e)) => warn!("Could not acquire YouTube OAuth token ({}); sending disabled.", e),
-            Err(_) => warn!("YouTube OAuth capture timed out; sending disabled."),
-        }
-    } else if oauth.has_creds() {
-        info!("YouTube OAuth refresh token present (sending enabled).");
-    } else if oauth_refresh.is_empty() {
-        warn!("YouTube sending disabled: set Google OAuth client id/secret (or a refresh token) in the credential form.");
-    }
+    // NOTE: the OAuth browser capture (which can block for up to
+    // `oauth_capture_timeout_secs`) runs BELOW, after the engine read loop has
+    // been spawned. Doing it here starved the engine's liveness probe for the
+    // whole capture window and got the connection severed.
 
     // Bounded SendToPlatforms queue: the read loop enqueues (never blocking, so
     // an AuthVerify reply is never delayed by a slow `ensure_access_token`
@@ -3130,6 +3185,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Now that the read loop is answering the engine's liveness probe, run the
+    // (potentially blocking) OAuth browser capture. If we have OAuth app
+    // credentials but no refresh token yet, acquire one via the browser flow
+    // (bounded so it can never hang forever).
+    if oauth.has_creds() && oauth_refresh.is_empty() {
+        info!("No YouTube refresh token yet — opening browser to authorize sending...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(tuning.oauth_capture_timeout_secs as u64),
+            oauth.acquire_refresh_token(&client),
+        )
+        .await
+        {
+            Ok(Ok(refresh)) => {
+                info!("Acquired YouTube refresh token (sending enabled).");
+                save_oauth_refresh_token(&refresh);
+            }
+            Ok(Err(e)) => warn!("Could not acquire YouTube OAuth token ({}); sending disabled.", e),
+            Err(_) => warn!("YouTube OAuth capture timed out; sending disabled."),
+        }
+    } else if oauth.has_creds() {
+        info!("YouTube OAuth refresh token present (sending enabled).");
+    } else if oauth_refresh.is_empty() {
+        warn!("YouTube sending disabled: set Google OAuth client id/secret (or a refresh token) in the credential form.");
+    }
+
     // ── Stream-control poll task ─────────────────────────────────────────
     // Every `stream_control_poll_secs`, read the engine's desired control
     // (`stream_schedule`) and, when the revision changed, apply it to the
@@ -3221,8 +3301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Linear setup phase ───────────────────────────────────────────────
     // Resolve auth + API keys, validate the target (channel/video) with an
     // explicit operator choice on failure, then surface a setup summary.
-    ensure_env_file();
-    cockatiel_client::load_env_file(".env");
+    // (`.env` was already loaded at the top of `main`.)
     let mut setup_log = String::new();
     let mut channel_input = std::env::var("YOUTUBE_CHANNEL_ID").unwrap_or_default();
     let mut api_keys: Vec<String> = Vec::new();
@@ -3371,7 +3450,16 @@ info!(
 // adapter rotates during polling anyway, so re-prompting for a key that already
 // exists just confuses the operator. Prompt only when the whole ring is dead
 // (e.g. the placeholder "testkey") so they never have to edit the config by hand.
-if !any_api_key_valid(&client, &key_manager).await {
+// A transport/parse failure is `Unknown`, not `Invalid`: never prompt for a new
+// key just because the network was briefly down — retry during polling instead.
+let key_status = any_api_key_valid(&client, &key_manager).await;
+if key_status == KeyValidity::Unknown {
+    warn!(
+        "Could not validate YouTube API key(s) due to a network/parse error — treating \
+         them as unknown and retrying during polling (not prompting for a new key)."
+    );
+}
+if key_status == KeyValidity::Invalid {
     warn!(
         "No usable YouTube API key among {} configured. Prompting for a valid key...",
         key_manager.key_count()
@@ -3409,11 +3497,16 @@ if !any_api_key_valid(&client, &key_manager).await {
             info!("YouTube API key updated and saved to config.json");
             // Re-validate immediately so we catch typos before entering the
             // discovery loop.
-            if !is_api_key_valid(&client, &key_manager).await {
-                warn!(
+            match is_api_key_valid(&client, &key_manager).await {
+                KeyValidity::Valid => {}
+                KeyValidity::Invalid => warn!(
                     "The key you entered still fails validation. \
                      You can re-enter it by restarting the module."
-                );
+                ),
+                KeyValidity::Unknown => warn!(
+                    "Could not validate the key you entered due to a network/parse \
+                     error; it may still be valid — retrying during polling."
+                ),
             }
         }
     } else {
