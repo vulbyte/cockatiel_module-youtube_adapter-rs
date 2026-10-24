@@ -134,6 +134,13 @@ struct YoutubeAdapterConfig {
     stream_fetch_retry_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::stream_scan_interval_secs")]
     stream_scan_interval_secs: u32,
+    /// Passive mode: when no stream is found, re-scan on a slow cadence
+    /// (`passive_scan_interval_secs`) instead of the regular
+    /// `stream_scan_interval_secs`, so an off-air channel stops polling often.
+    #[serde(default)]
+    passive: bool,
+    #[serde(default = "YoutubeAdapterConfig::passive_scan_interval_secs")]
+    passive_scan_interval_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::prompt_timeout_secs")]
     prompt_timeout_secs: u32,
     #[serde(default = "YoutubeAdapterConfig::stream_control_poll_secs")]
@@ -195,6 +202,9 @@ impl YoutubeAdapterConfig {
     fn stream_scan_interval_secs() -> u32 {
         30
     }
+    fn passive_scan_interval_secs() -> u32 {
+        300
+    }
     fn prompt_timeout_secs() -> u32 {
         300
     }
@@ -231,6 +241,8 @@ impl Default for YoutubeAdapterConfig {
             reconnect_max_secs: Self::reconnect_max_secs(),
             stream_fetch_retry_secs: Self::stream_fetch_retry_secs(),
             stream_scan_interval_secs: Self::stream_scan_interval_secs(),
+            passive: false,
+            passive_scan_interval_secs: Self::passive_scan_interval_secs(),
             prompt_timeout_secs: Self::prompt_timeout_secs(),
             stream_control_poll_secs: Self::stream_control_poll_secs(),
         }
@@ -260,6 +272,8 @@ struct Tuning {
     reconnect_max_secs: u32,
     stream_fetch_retry_secs: u32,
     stream_scan_interval_secs: u32,
+    passive: bool,
+    passive_scan_interval_secs: u32,
     prompt_timeout_secs: u32,
     stream_control_poll_secs: u32,
 }
@@ -285,6 +299,8 @@ impl Default for Tuning {
             reconnect_max_secs: YoutubeAdapterConfig::reconnect_max_secs(),
             stream_fetch_retry_secs: YoutubeAdapterConfig::stream_fetch_retry_secs(),
             stream_scan_interval_secs: YoutubeAdapterConfig::stream_scan_interval_secs(),
+            passive: false,
+            passive_scan_interval_secs: YoutubeAdapterConfig::passive_scan_interval_secs(),
             prompt_timeout_secs: YoutubeAdapterConfig::prompt_timeout_secs(),
             stream_control_poll_secs: YoutubeAdapterConfig::stream_control_poll_secs(),
         }
@@ -312,6 +328,8 @@ impl From<&YoutubeAdapterConfig> for Tuning {
             reconnect_max_secs: cfg.reconnect_max_secs,
             stream_fetch_retry_secs: cfg.stream_fetch_retry_secs,
             stream_scan_interval_secs: cfg.stream_scan_interval_secs,
+            passive: cfg.passive,
+            passive_scan_interval_secs: cfg.passive_scan_interval_secs,
             prompt_timeout_secs: cfg.prompt_timeout_secs,
             stream_control_poll_secs: cfg.stream_control_poll_secs,
         }
@@ -640,7 +658,7 @@ fn backfill_tuning_defaults_at(path: &std::path::Path) {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
-    let defaults: [(&str, i32); 19] = [
+    let defaults: [(&str, i32); 20] = [
         ("default_timeout_secs", 300),
         ("http_timeout_secs", 15),
         ("token_expiry_margin_secs", 60),
@@ -659,12 +677,17 @@ fn backfill_tuning_defaults_at(path: &std::path::Path) {
         ("reconnect_max_secs", 30),
         ("stream_fetch_retry_secs", 15),
         ("stream_scan_interval_secs", 30),
+        ("passive_scan_interval_secs", 300),
         ("prompt_timeout_secs", 300),
     ];
     for (key, value) in defaults {
         if ms.get(key).is_none() {
             ms[key] = serde_json::json!(value);
         }
+    }
+    // `passive` is a bool, so it is backfilled separately from the numeric table.
+    if ms.get("passive").is_none() {
+        ms["passive"] = serde_json::json!(false);
     }
     // Migrate the old poll-retry default (500ms — it hammered the API under
     // quota pressure) to the new less-aggressive base. Only rewritten while it
@@ -2984,6 +3007,17 @@ async fn poll_keyed_chat(
     }
 }
 
+/// The delay before the next no-stream re-scan: the slow passive cadence when
+/// passive mode is on (`passive_scan_interval_secs`), otherwise the regular
+/// `stream_scan_interval_secs`.
+fn no_stream_scan_interval_secs(tuning: &Tuning) -> u32 {
+    if tuning.passive {
+        tuning.passive_scan_interval_secs
+    } else {
+        tuning.stream_scan_interval_secs
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -3867,11 +3901,16 @@ loop {
     {
         Some(s) => s,
         None => {
-            info!("No streams currently found. Re-scanning in {} seconds...", tuning.stream_scan_interval_secs);
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                tuning.stream_scan_interval_secs as u64,
-            ))
-            .await;
+            // Passive mode slows the off-air re-scan, so an idle channel stops
+            // polling the API every `stream_scan_interval_secs`; otherwise use
+            // the regular scan interval.
+            let interval = no_stream_scan_interval_secs(&tuning);
+            if tuning.passive {
+                info!("No streams currently found. Passive mode — re-scanning in {interval} seconds...");
+            } else {
+                info!("No streams currently found. Re-scanning in {interval} seconds...");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval as u64)).await;
             continue;
         }
     };
@@ -4302,6 +4341,24 @@ mod tests {
     }
 
     #[test]
+    fn passive_mode_slows_the_no_stream_rescan() {
+        let mut t = Tuning::default();
+        assert!(!t.passive, "passive is off by default");
+        assert_eq!(t.passive_scan_interval_secs, 300, "passive cadence is 5 minutes");
+        // Default: the regular scan interval drives the off-air re-scan.
+        assert_eq!(no_stream_scan_interval_secs(&t), t.stream_scan_interval_secs);
+        assert_eq!(no_stream_scan_interval_secs(&t), 30);
+        // Passive: the slow cadence.
+        t.passive = true;
+        assert_eq!(no_stream_scan_interval_secs(&t), t.passive_scan_interval_secs);
+        assert_eq!(no_stream_scan_interval_secs(&t), 300);
+        // The serde config carries the same defaults.
+        let c = YoutubeAdapterConfig::default();
+        assert!(!c.passive);
+        assert_eq!(c.passive_scan_interval_secs, 300);
+    }
+
+    #[test]
     fn test_backfill_tuning_defaults_creates_and_preserves() {
         let dir = std::env::temp_dir().join(format!("yt_backfill_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4316,7 +4373,7 @@ mod tests {
         assert_eq!(ms["http_timeout_secs"], 15);
         assert_eq!(ms["dedup_cap"], 10_000);
         assert_eq!(ms["prompt_timeout_secs"], 300);
-        assert_eq!(ms.len(), 19, "all tuning defaults present");
+        assert_eq!(ms.len(), 21, "all tuning defaults present");
 
         // Existing keys are preserved, missing ones are added, top-level fields survive.
         std::fs::write(
@@ -4331,7 +4388,7 @@ mod tests {
         let ms = root["module_specific"].as_object().unwrap();
         assert_eq!(ms["default_timeout_secs"], 900, "existing value preserved");
         assert_eq!(ms["http_timeout_secs"], 15, "missing key backfilled");
-        assert_eq!(ms.len(), 19);
+        assert_eq!(ms.len(), 21);
 
         // The OLD poll-retry default (500) migrates to the new 2000 base...
         std::fs::write(
